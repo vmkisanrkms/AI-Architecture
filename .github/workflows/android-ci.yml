@@ -143,11 +143,10 @@ jobs:
 
           disable-animations: false
 
-          emulator-options: -no-window -no-audio -no-boot-anim -no-snapshot -no-snapshot-save
+          emulator-options: -no-window -no-audio -no-boot-anim
 
-          emulator-boot-timeout: 600
+          emulator-boot-timeout: 900
 
-          # Single folded command; no multiline find or if/fi blocks
           script: >-
             set -eu;
             SOURCE_DIR="${{ runner.temp }}/ai-architecture-source";
@@ -158,8 +157,15 @@ jobs:
             cd "$PROJECT_ROOT";
             test -f app/build.gradle.kts || test -f app/build.gradle;
             adb wait-for-device;
-            test "$(adb shell getprop sys.boot_completed | tr -d '\r')" = "1";
+            BOOTED=0;
+            for i in $(seq 1 120); do
+              BOOT_STATUS="$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)";
+              if [ "$BOOT_STATUS" = "1" ]; then BOOTED=1; break; fi;
+              sleep 5;
+            done;
+            if [ "$BOOTED" -ne 1 ]; then echo "Emulator boot verification failed"; adb devices -l; exit 1; fi;
             echo "Emulator boot PASS";
+            adb shell input keyevent 82 || true;
             gradle --no-daemon --stacktrace :app:compileDebugAndroidTestKotlin;
             gradle --no-daemon --stacktrace :app:connectedDebugAndroidTest
 

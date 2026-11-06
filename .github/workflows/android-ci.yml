@@ -19,39 +19,37 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
+    env:
+      SOURCE_DIR: ${{ runner.temp }}/ai-architecture-source
+      STATUS_DIR: ${{ runner.temp }}/ai-architecture-status
+
     steps:
-      # 1. Checkout repository
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 2. Setup JDK 17
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      # 3. Setup Android SDK
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
-        with:
-          packages: platform-tools
 
-      # 4. Install Android API 36 and Emulator image
-      - name: Install Android API 36 and Emulator image
+      - name: Install Android SDK and API 35 Emulator
         shell: bash
         run: |
           set -euo pipefail
 
           sdkmanager --install \
-            "platforms;android-35" \
-            "build-tools;36.0.0" \
             "platform-tools" \
+            "platforms;android-35" \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
             "emulator" \
-            "system-images;android-36;google_apis;x86_64"
+            "system-images;android-35;google_apis;x86_64"
 
-      # 5. Verify source ZIP
-      - name: Verify source ZIP
+      - name: Verify and extract source ZIP
         shell: bash
         run: |
           set -euo pipefail
@@ -65,27 +63,13 @@ jobs:
           fi
 
           unzip -t "$ZIP_FILE"
-          echo "ZIP integrity PASS"
 
-      # 6. Extract ZIP and detect project root
-      - name: Extract ZIP and detect project root
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          ZIP_FILE="AI_Architecture_Phase2_INSTRUMENTATION_FIX_V2_NOT_FINAL.zip"
-          SOURCE_DIR="$RUNNER_TEMP/ai-architecture-source"
-
-          rm -rf "$SOURCE_DIR"
-          mkdir -p "$SOURCE_DIR"
+          rm -rf "$SOURCE_DIR" "$STATUS_DIR"
+          mkdir -p "$SOURCE_DIR" "$STATUS_DIR"
 
           unzip -q "$ZIP_FILE" -d "$SOURCE_DIR"
 
-          SETTINGS_FILE="$(find "$SOURCE_DIR" -type f -name settings.gradle.kts -print -quit)"
-
-          if [ -z "$SETTINGS_FILE" ]; then
-            SETTINGS_FILE="$(find "$SOURCE_DIR" -type f -name settings.gradle -print -quit)"
-          fi
+          SETTINGS_FILE="$(find "$SOURCE_DIR" -type f \( -name settings.gradle.kts -o -name settings.gradle \) -print -quit)"
 
           if [ -z "$SETTINGS_FILE" ]; then
             echo "::error::Gradle settings file not found"
@@ -97,23 +81,19 @@ jobs:
 
           if [ ! -f "$PROJECT_ROOT/app/build.gradle.kts" ] && \
              [ ! -f "$PROJECT_ROOT/app/build.gradle" ]; then
-            echo "::error::Android app Gradle file not found"
+            echo "::error::App Gradle file not found"
             exit 1
           fi
 
           echo "PROJECT_ROOT=$PROJECT_ROOT" >> "$GITHUB_ENV"
-          echo "SOURCE_DIR=$SOURCE_DIR" >> "$GITHUB_ENV"
+          echo "Project root: $PROJECT_ROOT"
 
-          echo "Project root PASS: $PROJECT_ROOT"
-
-      # 7. Setup Gradle 8.11.1
       - name: Set up Gradle 8.11.1
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.11.1'
 
-      # 8. Verify Java Gradle and Android SDK
-      - name: Verify Java Gradle and Android SDK
+      - name: Verify build environment
         shell: bash
         run: |
           set -euo pipefail
@@ -123,17 +103,13 @@ jobs:
           sdkmanager --list_installed
 
           test -d "$PROJECT_ROOT"
-
-          test -f "$PROJECT_ROOT/settings.gradle.kts" || \
-            test -f "$PROJECT_ROOT/settings.gradle"
-
-          test -f "$PROJECT_ROOT/app/build.gradle.kts" || \
-            test -f "$PROJECT_ROOT/app/build.gradle"
+          test -d "$STATUS_DIR"
 
           echo "Environment verification PASS"
 
-      # 9. Emulator and instrumentation tests FIRST
-      - name: Boot Emulator and run instrumentation tests FIRST
+      - name: Boot API 35 Emulator and run instrumentation tests
+        id: emulator
+        continue-on-error: true
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 35
@@ -145,24 +121,41 @@ jobs:
           emulator-boot-timeout: 900
 
           script: >-
-            set -eu;
-            SOURCE_DIR="${{ runner.temp }}/ai-architecture-source";
-            SETTINGS_FILE="$(find "$SOURCE_DIR" -type f -name settings.gradle.kts -print -quit)";
-            if [ -z "$SETTINGS_FILE" ]; then SETTINGS_FILE="$(find "$SOURCE_DIR" -type f -name settings.gradle -print -quit)"; fi;
-            test -n "$SETTINGS_FILE";
+            set +e;
+            cd "${{ runner.temp }}/ai-architecture-source";
+            SETTINGS_FILE="$(find . -type f -name settings.gradle.kts -print -quit)";
+            if [ -z "$SETTINGS_FILE" ]; then SETTINGS_FILE="$(find . -type f -name settings.gradle -print -quit)"; fi;
+            if [ -z "$SETTINGS_FILE" ]; then echo "Project settings missing"; exit 1; fi;
             PROJECT_ROOT="$(dirname "$SETTINGS_FILE")";
             cd "$PROJECT_ROOT";
-            test -f app/build.gradle.kts || test -f app/build.gradle;
+            STATUS_DIR="${{ runner.temp }}/ai-architecture-status";
+            mark() { printf '%s\n' "$2" > "$STATUS_DIR/part-$1.txt"; };
+            diagnostics() {
+              DIAG_OK=1;
+              adb logcat -d -v time > "$STATUS_DIR/logcat.txt" 2>&1 || DIAG_OK=0;
+              adb shell dumpsys activity processes > "$STATUS_DIR/activity-processes.txt" 2>&1 || DIAG_OK=0;
+              adb shell dumpsys package > "$STATUS_DIR/package-dumpsys.txt" 2>&1 || DIAG_OK=0;
+              adb devices -l > "$STATUS_DIR/adb-devices.txt" 2>&1 || DIAG_OK=0;
+              grep -E -i 'FATAL EXCEPTION|AndroidRuntime|Process .* has died|am_crash|Instrumentation.*(crash|failed)' "$STATUS_DIR/logcat.txt" > "$STATUS_DIR/crash-summary.txt" || true;
+              if [ "$DIAG_OK" -eq 1 ]; then mark 6 PASS; else mark 6 FAIL; fi;
+            };
+            trap diagnostics EXIT;
             adb wait-for-device;
             BOOT_STATUS="";
-            for i in $(seq 1 120); do BOOT_STATUS="$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)"; if [ "$BOOT_STATUS" = "1" ]; then break; fi; sleep 5; done;
-            if [ "$BOOT_STATUS" != "1" ]; then echo "Emulator boot verification failed"; adb devices -l; exit 1; fi;
-            echo "Emulator boot PASS";
-            gradle --no-daemon --stacktrace :app:compileDebugAndroidTestKotlin;
-            gradle --no-daemon --stacktrace :app:connectedDebugAndroidTest
+            for i in $(seq 1 120); do BOOT_STATUS="$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')"; if [ "$BOOT_STATUS" = "1" ]; then break; fi; sleep 5; done;
+            if [ "$BOOT_STATUS" != "1" ]; then echo "Emulator boot FAILED"; mark 1 FAIL; exit 1; fi;
+            mark 1 PASS;
+            API_LEVEL="$(adb shell getprop ro.build.version.sdk | tr -d '\r')";
+            if [ "$API_LEVEL" = "35" ]; then mark 2 PASS; else echo "Expected API 35, got $API_LEVEL"; mark 2 FAIL; exit 1; fi;
+            if gradle --no-daemon --stacktrace :app:compileDebugAndroidTestKotlin; then mark 3 PASS; else mark 3 FAIL; exit 1; fi;
+            if gradle --no-daemon --stacktrace :app:assembleDebug :app:assembleDebugAndroidTest; then mark 4 PASS; else mark 4 FAIL; exit 1; fi;
+            if gradle --no-daemon --stacktrace :app:connectedDebugAndroidTest; then mark 5 PASS; else mark 5 FAIL; fi;
+            if [ -s app/build/outputs/apk/debug/app-debug.apk ]; then echo "Debug APK verification PASS"; else echo "Debug APK missing"; mark 4 FAIL; fi;
+            exit 0
 
-      # 10. Static project verifiers
-      - name: Run all static project verifiers
+      - name: Run static project verifiers
+        id: static
+        if: always()
         shell: bash
         run: |
           set -euo pipefail
@@ -174,10 +167,9 @@ jobs:
           python3 scripts/verify_phase2_closeout.py
           python3 scripts/verify_build_readiness.py
 
-          echo "Static verification PASS"
-
-      # 11. Android Debug Build
-      - name: Android Debug Build
+      - name: Build Android Debug APK
+        id: debug
+        if: always()
         shell: bash
         run: |
           set -euo pipefail
@@ -186,8 +178,15 @@ jobs:
 
           gradle --no-daemon --stacktrace :app:assembleDebug
 
-      # 12. JVM Unit Tests
+          APK="app/build/outputs/apk/debug/app-debug.apk"
+
+          test -s "$APK"
+          sha256sum "$APK"
+          stat -c 'APK_SIZE_BYTES=%s' "$APK"
+
       - name: Run JVM Unit Tests
+        id: unit
+        if: always()
         shell: bash
         run: |
           set -euo pipefail
@@ -196,8 +195,9 @@ jobs:
 
           gradle --no-daemon --stacktrace :app:testDebugUnitTest
 
-      # 13. Android Lint
       - name: Run Android Lint
+        id: lint
+        if: always()
         shell: bash
         run: |
           set -euo pipefail
@@ -206,15 +206,109 @@ jobs:
 
           gradle --no-daemon --stacktrace :app:lintDebug
 
-      # 14. Upload APK and reports
-      - name: Upload APK and test reports
+      - name: Verify APK and test reports
+        id: outputs
+        if: always()
+        shell: bash
+        run: |
+          set -u
+
+          cd "$PROJECT_ROOT"
+          RESULT=0
+
+          APK="app/build/outputs/apk/debug/app-debug.apk"
+
+          if [ -s "$APK" ]; then
+            echo "APK verification PASS"
+            sha256sum "$APK"
+          else
+            echo "::error::APK missing or empty"
+            RESULT=1
+          fi
+
+          XML_COUNT="$(find app/build/test-results -type f -name 'TEST-*.xml' 2>/dev/null | wc -l | tr -d ' ')"
+          echo "JVM_TEST_XML_COUNT=$XML_COUNT"
+
+          if [ -f "$STATUS_DIR/part-5.txt" ] && \
+             [ "$(cat "$STATUS_DIR/part-5.txt")" = "PASS" ]; then
+            echo "Instrumentation status PASS"
+          else
+            echo "::error::Instrumentation tests did not pass"
+            RESULT=1
+          fi
+
+          exit "$RESULT"
+
+      - name: Final CI result
+        if: always()
+        shell: bash
+        env:
+          EMULATOR_OUTCOME: ${{ steps.emulator.outcome }}
+          STATIC_OUTCOME: ${{ steps.static.outcome }}
+          DEBUG_OUTCOME: ${{ steps.debug.outcome }}
+          UNIT_OUTCOME: ${{ steps.unit.outcome }}
+          LINT_OUTCOME: ${{ steps.lint.outcome }}
+          OUTPUTS_OUTCOME: ${{ steps.outputs.outcome }}
+        run: |
+          set -u
+
+          RESULT=0
+
+          echo "========== AI ARCHITECTURE CI REPORT =========="
+
+          for PART in 1 2 3 4 5 6; do
+            FILE="$STATUS_DIR/part-$PART.txt"
+
+            if [ -f "$FILE" ]; then
+              VALUE="$(cat "$FILE")"
+            else
+              VALUE="NOT_REACHED"
+            fi
+
+            echo "EMULATOR_PART_$PART=$VALUE"
+
+            if [ "$VALUE" != "PASS" ]; then
+              RESULT=1
+            fi
+          done
+
+          echo "STATIC=$STATIC_OUTCOME"
+          echo "DEBUG_BUILD=$DEBUG_OUTCOME"
+          echo "JVM_UNIT_TESTS=$UNIT_OUTCOME"
+          echo "ANDROID_LINT=$LINT_OUTCOME"
+          echo "OUTPUT_VERIFICATION=$OUTPUTS_OUTCOME"
+          echo "EMULATOR_ACTION=$EMULATOR_OUTCOME"
+
+          for VALUE in \
+            "$STATIC_OUTCOME" \
+            "$DEBUG_OUTCOME" \
+            "$UNIT_OUTCOME" \
+            "$LINT_OUTCOME" \
+            "$OUTPUTS_OUTCOME" \
+            "$EMULATOR_OUTCOME"
+          do
+            if [ "$VALUE" != "success" ]; then
+              RESULT=1
+            fi
+          done
+
+          if [ "$RESULT" -eq 0 ]; then
+            echo "FINAL_RESULT=PASS"
+          else
+            echo "::error::FINAL_RESULT=FAIL"
+          fi
+
+          exit "$RESULT"
+
+      - name: Upload APK, reports, and emulator diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ai-architecture-phase2-debug-and-reports
+          name: ai-architecture-phase2-ci-diagnostics
           if-no-files-found: warn
           path: |
             ${{ runner.temp }}/ai-architecture-source/**/app/build/outputs/apk/debug/*.apk
             ${{ runner.temp }}/ai-architecture-source/**/app/build/reports/**
             ${{ runner.temp }}/ai-architecture-source/**/app/build/test-results/**
             ${{ runner.temp }}/ai-architecture-source/**/app/build/outputs/androidTest-results/**
+            ${{ runner.temp }}/ai-architecture-status/**

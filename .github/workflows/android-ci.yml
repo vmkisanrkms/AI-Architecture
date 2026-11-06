@@ -1,3 +1,4 @@
+
 name: AI Architecture Android CI
 
 on:
@@ -18,15 +19,19 @@ jobs:
     name: Build, JVM Tests, Lint and Emulator Tests
     runs-on: ubuntu-latest
     timeout-minutes: 120
+
     env:
       STATUS_DIR: ${{ github.workspace }}/.ci-ai-architecture-status
       BUNDLE_DIR: ${{ github.workspace }}/.ci-ai-architecture-bundle
 
     steps:
+
+      # 1. Checkout
       - name: Checkout repository
         id: checkout
         uses: actions/checkout@v4
 
+      # 2. Java 17
       - name: Set up JDK 17
         id: java
         uses: actions/setup-java@v4
@@ -34,144 +39,238 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Install Android SDK without deprecated tools package
+      # 3. Android SDK
+      - name: Install Android SDK without deprecated tools
         id: sdk
         shell: bash
         run: |
           set -Eeuo pipefail
+
           ANDROID_HOME="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
-          SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager -perm -u+x -print -quit)"
-          if [[ -z "$SDKMANAGER" ]]; then
-            echo "::error::sdkmanager executable not found"
-            find "$ANDROID_HOME/cmdline-tools" -maxdepth 5 -type f -print || true
+
+          if [[ ! -d "$ANDROID_HOME/cmdline-tools" ]]; then
+            echo "::error::Android command-line tools directory missing"
             exit 1
           fi
+
+          SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" \
+            -type f -name sdkmanager -perm -u+x -print -quit)"
+
+          if [[ -z "$SDKMANAGER" ]]; then
+            echo "::error::sdkmanager executable not found"
+            exit 1
+          fi
+
           echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
+
           echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
           echo "$ANDROID_HOME/emulator" >> "$GITHUB_PATH"
+
           echo "Using sdkmanager: $SDKMANAGER"
+
           set +e
           yes | "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --licenses
           LICENSE_STATUS=${PIPESTATUS[1]}
           set -e
+
           if [[ "$LICENSE_STATUS" -ne 0 ]]; then
-            echo "::error::SDK license acceptance failed: $LICENSE_STATUS"
+            echo "::error::SDK license acceptance failed"
             exit "$LICENSE_STATUS"
           fi
+
           "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --install \
-            'platform-tools' \
-            'platforms;android-35' \
-            'platforms;android-36' \
-            'build-tools;36.0.0' \
-            'emulator' \
-            'system-images;android-35;google_apis;x86_64'
+            "platform-tools" \
+            "platforms;android-35" \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "emulator" \
+            "system-images;android-35;google_apis;x86_64"
+
           test -x "$ANDROID_HOME/platform-tools/adb"
           test -x "$ANDROID_HOME/emulator/emulator"
           test -d "$ANDROID_HOME/platforms/android-35"
           test -d "$ANDROID_HOME/platforms/android-36"
           test -d "$ANDROID_HOME/build-tools/36.0.0"
           test -d "$ANDROID_HOME/system-images/android-35/google_apis/x86_64"
+
           "$ANDROID_HOME/platform-tools/adb" version
+
           echo "ANDROID_SDK_INSTALL=PASS"
 
-      - name: Extract uploaded CI bundle and locate project
+      # 4. Extract complete CI bundle
+      - name: Extract and validate CI bundle
         id: source
         shell: bash
         run: |
           set -Eeuo pipefail
-          mkdir -p "$STATUS_DIR"
+
           ZIP_FILE="$GITHUB_WORKSPACE/AI_Architecture_CI_CORRECTED_COMPLETE_V2.zip"
+
           if [[ ! -s "$ZIP_FILE" ]]; then
-            echo "::error::Required ZIP missing: $ZIP_FILE"
-            echo "Upload AI_Architecture_CI_CORRECTED_COMPLETE_V2.zip to repository root."
+            echo "::error::CI bundle ZIP missing"
             ls -lah "$GITHUB_WORKSPACE"
             exit 1
           fi
+
           unzip -t "$ZIP_FILE"
-          rm -rf "$BUNDLE_DIR"
-          mkdir -p "$BUNDLE_DIR"
+
+          rm -rf "$BUNDLE_DIR" "$STATUS_DIR"
+          mkdir -p "$BUNDLE_DIR" "$STATUS_DIR"
+
           unzip -q "$ZIP_FILE" -d "$BUNDLE_DIR"
+
           PROJECT_ROOT="$BUNDLE_DIR/AI_Architecture"
           EMULATOR_SCRIPT="$BUNDLE_DIR/.github/scripts/run-emulator-tests.sh"
           REPORT_SCRIPT="$BUNDLE_DIR/ci/verify-test-reports.py"
-          for file in \
+
+          for FILE in \
             "$PROJECT_ROOT/settings.gradle.kts" \
             "$PROJECT_ROOT/app/build.gradle.kts" \
             "$PROJECT_ROOT/app/src/main/AndroidManifest.xml" \
+            "$PROJECT_ROOT/scripts/verify_project.py" \
+            "$PROJECT_ROOT/scripts/verify_phase2.py" \
+            "$PROJECT_ROOT/scripts/verify_phase2_closeout.py" \
+            "$PROJECT_ROOT/scripts/verify_build_readiness.py" \
             "$EMULATOR_SCRIPT" \
-            "$REPORT_SCRIPT"; do
-            if [[ ! -s "$file" ]]; then
-              echo "::error::Required bundle file missing: $file"
+            "$REPORT_SCRIPT"
+          do
+            if [[ ! -s "$FILE" ]]; then
+              echo "::error::Required file missing: $FILE"
               exit 1
             fi
           done
+
           echo "PROJECT_ROOT=$PROJECT_ROOT" >> "$GITHUB_ENV"
           echo "EMULATOR_SCRIPT=$EMULATOR_SCRIPT" >> "$GITHUB_ENV"
           echo "REPORT_SCRIPT=$REPORT_SCRIPT" >> "$GITHUB_ENV"
+
           chmod +x "$EMULATOR_SCRIPT"
+
           bash -n "$EMULATOR_SCRIPT"
           python3 -m py_compile "$REPORT_SCRIPT"
-          echo "Bundle extraction and validation PASS"
 
+          echo "ZIP extraction PASS"
+          echo "PROJECT_ROOT=$PROJECT_ROOT"
+
+      # 5. Gradle
       - name: Set up Gradle 8.11.1
         id: gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.11.1'
 
+      # 6. Fix workflow visibility for project verifier
+      - name: Prepare workflow for static verification
+        id: workflow_prepare
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          WORKFLOW_SOURCE="$GITHUB_WORKSPACE/.github/workflows/android-ci.yml"
+          WORKFLOW_DEST="$PROJECT_ROOT/.github/workflows/android-ci.yml"
+
+          if [[ ! -s "$WORKFLOW_SOURCE" ]]; then
+            echo "::error::Repository workflow file not found"
+            exit 1
+          fi
+
+          mkdir -p "$(dirname "$WORKFLOW_DEST")"
+          cp "$WORKFLOW_SOURCE" "$WORKFLOW_DEST"
+
+          test -s "$WORKFLOW_DEST"
+
+          echo "Workflow copied into extracted project"
+          echo "Workflow path: $WORKFLOW_DEST"
+
+      # 7. Static verification
       - name: Verify source and run static verifiers
         id: static
         shell: bash
         run: |
           set -Eeuo pipefail
+
           cd "$PROJECT_ROOT"
+
           python3 scripts/verify_project.py
           python3 scripts/verify_phase2.py
           python3 scripts/verify_phase2_closeout.py
           python3 scripts/verify_build_readiness.py
+
           echo "Static verification PASS"
 
+      # 8. Instrumentation configuration
       - name: Verify Android instrumentation configuration
         id: test_config
         shell: bash
         run: |
           set -Eeuo pipefail
+
           APP_GRADLE="$PROJECT_ROOT/app/build.gradle.kts"
+
+          if [[ ! -f "$APP_GRADLE" ]]; then
+            APP_GRADLE="$PROJECT_ROOT/app/build.gradle"
+          fi
+
           grep -Fq 'androidx.test.runner.AndroidJUnitRunner' "$APP_GRADLE"
           grep -Fq 'androidTestImplementation' "$APP_GRADLE"
-          test -d "$PROJECT_ROOT/app/src/androidTest"
-          find "$PROJECT_ROOT/app/src/androidTest" -type f \( -name '*.kt' -o -name '*.java' \) -print
 
+          test -d "$PROJECT_ROOT/app/src/androidTest"
+
+          find "$PROJECT_ROOT/app/src/androidTest" \
+            -type f \( -name '*.kt' -o -name '*.java' \) -print
+
+          echo "Instrumentation configuration PASS"
+
+      # 9. Build APKs
       - name: Assemble Debug and Android Test APKs
         id: assemble
         shell: bash
         run: |
           set -Eeuo pipefail
+
           cd "$PROJECT_ROOT"
+
           gradle --no-daemon --stacktrace \
             :app:compileDebugAndroidTestKotlin \
             :app:assembleDebug \
             :app:assembleDebugAndroidTest
-          test -s app/build/outputs/apk/debug/app-debug.apk
-          test -s app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
 
+          APK="app/build/outputs/apk/debug/app-debug.apk"
+          TEST_APK="app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk"
+
+          test -s "$APK"
+          test -s "$TEST_APK"
+
+          sha256sum "$APK" "$TEST_APK"
+
+          echo "APK assembly PASS"
+
+      # 10. JVM tests
       - name: Run JVM Unit Tests
         id: unit
         shell: bash
         run: |
           set -Eeuo pipefail
-          cd "$PROJECT_ROOT"
-          gradle --no-daemon --stacktrace :app:testDebugUnitTest
 
+          cd "$PROJECT_ROOT"
+
+          gradle --no-daemon --stacktrace \
+            :app:testDebugUnitTest
+
+      # 11. Lint
       - name: Run Android Lint
         id: lint
         shell: bash
         run: |
           set -Eeuo pipefail
-          cd "$PROJECT_ROOT"
-          gradle --no-daemon --stacktrace :app:lintDebug
 
+          cd "$PROJECT_ROOT"
+
+          gradle --no-daemon --stacktrace \
+            :app:lintDebug
+
+      # 12. Emulator instrumentation tests
       - name: Boot API 35 Emulator and run instrumentation tests
         id: emulator
         if: steps.assemble.outcome == 'success'
@@ -180,8 +279,8 @@ jobs:
         env:
           PROJECT_ROOT: ${{ env.PROJECT_ROOT }}
           STATUS_DIR: ${{ env.STATUS_DIR }}
-          ANDROID_HOME: ${{ env.ANDROID_HOME }}
           EMULATOR_SCRIPT: ${{ env.EMULATOR_SCRIPT }}
+          ANDROID_HOME: ${{ env.ANDROID_HOME }}
         with:
           api-level: 35
           target: google_apis
@@ -192,16 +291,19 @@ jobs:
           emulator-boot-timeout: 900
           script: bash "$EMULATOR_SCRIPT"
 
+      # 13. Verify reports only after APK build
       - name: Verify APKs and test reports
         id: reports
-        if: always() && steps.source.outcome == 'success'
+        if: always() && steps.assemble.outcome == 'success'
         shell: bash
         run: |
           set -Eeuo pipefail
+
           python3 "$REPORT_SCRIPT" \
             --project-root "$PROJECT_ROOT" \
             --status-dir "$STATUS_DIR"
 
+      # 14. Final CI report
       - name: Final CI Summary
         id: summary
         if: always()
@@ -212,6 +314,7 @@ jobs:
           SDK: ${{ steps.sdk.outcome }}
           SOURCE: ${{ steps.source.outcome }}
           GRADLE: ${{ steps.gradle.outcome }}
+          WORKFLOW_PREPARE: ${{ steps.workflow_prepare.outcome }}
           STATIC: ${{ steps.static.outcome }}
           TEST_CONFIG: ${{ steps.test_config.outcome }}
           ASSEMBLE: ${{ steps.assemble.outcome }}
@@ -221,15 +324,19 @@ jobs:
           REPORTS: ${{ steps.reports.outcome }}
         run: |
           set -u
+
           mkdir -p "$STATUS_DIR"
+
           RESULT=0
+
           {
-            echo 'AI ARCHITECTURE CI SUMMARY'
+            echo "========== AI ARCHITECTURE CI SUMMARY =========="
             echo "CHECKOUT=$CHECKOUT"
             echo "JDK17=$JAVA"
             echo "ANDROID_SDK_SETUP=$SDK"
             echo "SOURCE_BUNDLE=$SOURCE"
             echo "GRADLE=$GRADLE"
+            echo "WORKFLOW_PREPARE=$WORKFLOW_PREPARE"
             echo "STATIC_VERIFIERS=$STATIC"
             echo "TEST_CONFIGURATION=$TEST_CONFIG"
             echo "APK_ASSEMBLY=$ASSEMBLE"
@@ -238,17 +345,27 @@ jobs:
             echo "EMULATOR_STEP=$EMULATOR"
             echo "REPORT_VERIFICATION=$REPORTS"
           } | tee "$STATUS_DIR/final-ci-summary.txt"
-          for value in "$CHECKOUT" "$JAVA" "$SDK" "$SOURCE" "$GRADLE" "$STATIC" "$TEST_CONFIG" "$ASSEMBLE" "$UNIT" "$LINT" "$EMULATOR" "$REPORTS"; do
-            [[ "$value" == success ]] || RESULT=1
+
+          for VALUE in \
+            "$CHECKOUT" "$JAVA" "$SDK" "$SOURCE" "$GRADLE" \
+            "$WORKFLOW_PREPARE" "$STATIC" "$TEST_CONFIG" \
+            "$ASSEMBLE" "$UNIT" "$LINT" "$EMULATOR" "$REPORTS"
+          do
+            if [[ "$VALUE" != "success" ]]; then
+              RESULT=1
+            fi
           done
+
           if [[ "$RESULT" -eq 0 ]]; then
-            echo 'FINAL_RESULT=PASS' | tee -a "$STATUS_DIR/final-ci-summary.txt"
+            echo "FINAL_RESULT=PASS" | tee -a "$STATUS_DIR/final-ci-summary.txt"
           else
-            echo 'FINAL_RESULT=FAIL' | tee -a "$STATUS_DIR/final-ci-summary.txt"
-            echo '::error::One or more required CI steps failed'
+            echo "::error::FINAL_RESULT=FAIL"
+            echo "FINAL_RESULT=FAIL" | tee -a "$STATUS_DIR/final-ci-summary.txt"
           fi
+
           exit "$RESULT"
 
+      # 15. Upload all diagnostics
       - name: Upload APKs, reports and diagnostics
         if: always()
         uses: actions/upload-artifact@v4
@@ -261,3 +378,4 @@ jobs:
             .ci-ai-architecture-bundle/AI_Architecture/app/build/test-results/**
             .ci-ai-architecture-bundle/AI_Architecture/app/build/outputs/androidTest-results/**
             .ci-ai-architecture-status/**
+            .ci-ai-architecture-bundle/.github/scripts/run-emulator-tests.sh

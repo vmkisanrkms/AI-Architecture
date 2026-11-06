@@ -49,7 +49,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          AI_Architecture_Phase2_UNIT_TEST_FIX_V1_NOT_FINAL.zip"
+          ZIP_FILE="AI_Architecture_Phase2_UNIT_TEST_FIX_V1_NOT_FINAL.zip"
 
           if [ ! -f "$ZIP_FILE" ]; then
             echo "::error::V1 source ZIP not found: $ZIP_FILE"
@@ -64,7 +64,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          ZIP_FILE="AI_Architecture_Phase2_KOTLIN_COMPILE_FIX_V1_NOT_FINAL.zip"
+          ZIP_FILE="AI_Architecture_Phase2_UNIT_TEST_FIX_V1_NOT_FINAL.zip"
 
           mkdir -p "$RUNNER_TEMP/ai-architecture-source"
 

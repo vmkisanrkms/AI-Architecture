@@ -36,7 +36,7 @@ jobs:
         with:
           packages: platform-tools
 
-      - name: Install Android platform and build tools
+      - name: Install Android platform, build tools and emulator
         shell: bash
         run: |
           set -euo pipefail
@@ -44,7 +44,8 @@ jobs:
             "platforms;android-36" \
             "build-tools;36.0.0" \
             "platform-tools" \
-            "emulator"
+            "emulator" \
+            "system-images;android-36;google_apis;x86_64"
 
       - name: Verify V2 source ZIP
         shell: bash
@@ -73,10 +74,11 @@ jobs:
           mkdir -p "$SOURCE_DIR"
           unzip -q "$ZIP_FILE" -d "$SOURCE_DIR"
 
-          SETTINGS_FILE="$(find "$SOURCE_DIR" -type f \( \
-            -name settings.gradle.kts -o \
-            -name settings.gradle \
-          \) -print -quit)"
+          SETTINGS_FILE="$(find "$SOURCE_DIR" -type f -name settings.gradle.kts -print -quit)"
+
+          if [ -z "$SETTINGS_FILE" ]; then
+            SETTINGS_FILE="$(find "$SOURCE_DIR" -type f -name settings.gradle -print -quit)"
+          fi
 
           if [ -z "$SETTINGS_FILE" ]; then
             echo "::error::Gradle settings file not found"
@@ -102,72 +104,30 @@ jobs:
         with:
           gradle-version: '8.11.1'
 
-      # FIRST: Emulator instrumentation tests
+      # Emulator tests run before the remaining build and test steps.
       - name: Run emulator instrumentation tests FIRST
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 36
+          target: google_apis
           arch: x86_64
           profile: pixel_2
           disable-animations: true
-          script: |
-            set -eu
-
-            SOURCE_DIR="${{ runner.temp }}/ai-architecture-source"
-
-            echo "Finding Android Gradle project..."
-
-            SETTINGS_FILE="$(find "$SOURCE_DIR" -type f \( \
-              -name settings.gradle.kts -o \
-              -name settings.gradle \
-            \) -print -quit)"
-
-            if [ -z "$SETTINGS_FILE" ]; then
-              echo "ERROR: Gradle settings file not found"
-              exit 1
-            fi
-
-            PROJECT_ROOT="$(dirname "$SETTINGS_FILE")"
-
-            echo "Project root: $PROJECT_ROOT"
-            cd "$PROJECT_ROOT"
-
-            if [ ! -f app/build.gradle.kts ] && \
-               [ ! -f app/build.gradle ]; then
-              echo "ERROR: Android app Gradle file missing"
-              exit 1
-            fi
-
-            echo "Waiting for emulator..."
-            adb wait-for-device
-
-            BOOT_STATUS=""
-
-            for i in $(seq 1 60); do
-              BOOT_STATUS="$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')"
-
-              if [ "$BOOT_STATUS" = "1" ]; then
-                break
-              fi
-
-              sleep 5
-            done
-
-            if [ "$BOOT_STATUS" != "1" ]; then
-              echo "ERROR: Emulator boot timeout"
-              adb devices
-              exit 1
-            fi
-
-            echo "Emulator boot PASS"
-
-            echo "Compiling instrumentation tests..."
-            gradle --no-daemon --stacktrace \
-              :app:compileDebugAndroidTestKotlin
-
-            echo "Running instrumentation tests..."
-            gradle --no-daemon --stacktrace \
-              :app:connectedDebugAndroidTest
+          emulator-options: -no-window -no-audio -no-boot-anim
+          script: >-
+            set -eu;
+            SOURCE_DIR="${{ runner.temp }}/ai-architecture-source";
+            SETTINGS_FILE="$(find "$SOURCE_DIR" -type f -name settings.gradle.kts -print -quit)";
+            if [ -z "$SETTINGS_FILE" ]; then SETTINGS_FILE="$(find "$SOURCE_DIR" -type f -name settings.gradle -print -quit)"; fi;
+            test -n "$SETTINGS_FILE";
+            PROJECT_ROOT="$(dirname "$SETTINGS_FILE")";
+            cd "$PROJECT_ROOT";
+            test -f app/build.gradle.kts || test -f app/build.gradle;
+            adb wait-for-device;
+            test "$(adb shell getprop sys.boot_completed | tr -d '\r')" = "1";
+            echo "Emulator boot PASS";
+            gradle --no-daemon --stacktrace :app:compileDebugAndroidTestKotlin;
+            gradle --no-daemon --stacktrace :app:connectedDebugAndroidTest
 
       - name: Verify Java Gradle and Android SDK
         shell: bash

@@ -1,18 +1,23 @@
 
-# Mobile upload helper: copy this file's contents into GitHub path
-# .github/workflows/android-ci.yml when uploading the Phase 2 ZIP to a repository.
 name: AI Architecture Phase 2 Android CI (ZIP upload)
 
 on:
   push:
-    branches: [ main, master ]
+    branches:
+      - main
+      - master
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ai-architecture-phase2-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   android:
+    name: Android Build and Tests
     runs-on: ubuntu-latest
     timeout-minutes: 90
 
@@ -28,38 +33,134 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools'
 
       - name: Install Android platform and build tools
-        run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0' 'platform-tools'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --install \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "platform-tools" \
+            "emulator"
+
+      - name: Verify V2 source ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ZIP_FILE="AI_Architecture_Phase2_INSTRUMENTATION_FIX_V2_NOT_FINAL.zip"
+
+          if [ ! -f "$ZIP_FILE" ]; then
+            echo "::error::V2 source ZIP not found: $ZIP_FILE"
+            ls -la
+            exit 1
+          fi
+
+          unzip -t "$ZIP_FILE"
+          echo "V2 ZIP integrity PASS"
+
+      - name: Extract and locate Android project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ZIP_FILE="AI_Architecture_Phase2_INSTRUMENTATION_FIX_V2_NOT_FINAL.zip"
+          SOURCE_DIR="$RUNNER_TEMP/ai-architecture-source"
+
+          rm -rf "$SOURCE_DIR"
+          mkdir -p "$SOURCE_DIR"
+
+          unzip -q "$ZIP_FILE" -d "$SOURCE_DIR"
+
+          echo "Searching for Gradle settings..."
+
+          SETTINGS_FILE="$(find "$SOURCE_DIR" -type f -name settings.gradle.kts -print -quit)"
+
+          if [ -z "$SETTINGS_FILE" ]; then
+            SETTINGS_FILE="$(find "$SOURCE_DIR" -type f -name settings.gradle -print -quit)"
+          fi
+
+          if [ -z "$SETTINGS_FILE" ]; then
+            echo "::error::Gradle settings file not found"
+            find "$SOURCE_DIR" -maxdepth 7 -type f
+            exit 1
+          fi
+
+          PROJECT_ROOT="$(dirname "$SETTINGS_FILE")"
+
+          if [ ! -f "$PROJECT_ROOT/app/build.gradle.kts" ] && \
+             [ ! -f "$PROJECT_ROOT/app/build.gradle" ]; then
+            echo "::error::Android app Gradle file not found"
+            echo "Detected root: $PROJECT_ROOT"
+            find "$PROJECT_ROOT" -maxdepth 4 -type f
+            exit 1
+          fi
+
+          echo "PROJECT_ROOT=$PROJECT_ROOT" >> "$GITHUB_ENV"
+
+          echo "Android project root verified:"
+          echo "$PROJECT_ROOT"
 
       - name: Set up Gradle 8.11.1
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.11.1'
 
-      - name: Extract uploaded Phase 2 source ZIP
+      - name: Verify Java Gradle and Android SDK
+        shell: bash
         run: |
           set -euo pipefail
-          test -f AI_Architecture_Phase2_INSTRUMENTATION_FIX_V2_NOT_FINAL.zip
-          mkdir -p "$RUNNER_TEMP/ai-architecture-source"
-          unzip -q AI_Architecture_Phase2_INSTRUMENTATION_FIX_V2_NOT_FINAL.zip -d "$RUNNER_TEMP/ai-architecture-source"
-          echo "PROJECT_ROOT=$RUNNER_TEMP/ai-architecture-source/AI_Architecture" >> "$GITHUB_ENV"
 
-      - name: Verify source and build configuration
+          java -version
+          gradle --version
+          sdkmanager --list_installed
+
+          test -d "$PROJECT_ROOT"
+
+          test -f "$PROJECT_ROOT/settings.gradle.kts" || \
+            test -f "$PROJECT_ROOT/settings.gradle"
+
+          test -f "$PROJECT_ROOT/app/build.gradle.kts" || \
+            test -f "$PROJECT_ROOT/app/build.gradle"
+
+      - name: Run all static project verifiers
+        shell: bash
         run: |
-          python3 "$PROJECT_ROOT/scripts/verify_project.py"
-          python3 "$PROJECT_ROOT/scripts/verify_phase2.py"
-          python3 "$PROJECT_ROOT/scripts/verify_phase2_closeout.py"
-          python3 "$PROJECT_ROOT/scripts/verify_build_readiness.py"
+          set -euo pipefail
+
+          cd "$PROJECT_ROOT"
+
+          python3 scripts/verify_project.py
+          python3 scripts/verify_phase2.py
+          python3 scripts/verify_phase2_closeout.py
+          python3 scripts/verify_build_readiness.py
 
       - name: Android debug build
-        run: cd "$PROJECT_ROOT" && gradle --no-daemon --stacktrace :app:assembleDebug
+        shell: bash
+        run: |
+          set -euo pipefail
 
-      - name: Run all unit tests
-        run: cd "$PROJECT_ROOT" && gradle --no-daemon --stacktrace :app:testDebugUnitTest
+          cd "$PROJECT_ROOT"
+          gradle --no-daemon --stacktrace :app:assembleDebug
+
+      - name: Run unit tests
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$PROJECT_ROOT"
+          gradle --no-daemon --stacktrace :app:testDebugUnitTest
 
       - name: Run Android lint
-        run: cd "$PROJECT_ROOT" && gradle --no-daemon --stacktrace :app:lintDebug
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$PROJECT_ROOT"
+          gradle --no-daemon --stacktrace :app:lintDebug
 
       - name: Run emulator instrumentation tests
         uses: reactivecircus/android-emulator-runner@v2
@@ -68,16 +169,21 @@ jobs:
           arch: x86_64
           profile: pixel_2
           disable-animations: true
-          script: cd "$PROJECT_ROOT" && gradle --no-daemon --stacktrace :app:connectedDebugAndroidTest
+          script: |
+            cd "$PROJECT_ROOT" && \
+            test -f settings.gradle.kts && \
+            test -f app/build.gradle.kts && \
+            adb wait-for-device && \
+            gradle --no-daemon --stacktrace :app:connectedDebugAndroidTest
 
-      - name: Upload debug APK and test reports
+      - name: Upload APK and test reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ai-architecture-phase2-debug-build-and-reports
-          path: |
-            ${{ runner.temp }}/ai-architecture-source/AI_Architecture/app/build/outputs/apk/debug/*.apk
-            ${{ runner.temp }}/ai-architecture-source/AI_Architecture/app/build/reports/**
-            ${{ runner.temp }}/ai-architecture-source/AI_Architecture/app/build/test-results/**
-            ${{ runner.temp }}/ai-architecture-source/AI_Architecture/app/build/outputs/androidTest-results/**
+          name: ai-architecture-phase2-v2-debug-and-reports
           if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/ai-architecture-source/**/app/build/outputs/apk/debug/*.apk
+            ${{ runner.temp }}/ai-architecture-source/**/app/build/reports/**
+            ${{ runner.temp }}/ai-architecture-source/**/app/build/test-results/**
+            ${{ runner.temp }}/ai-architecture-source/**/app/build/outputs/androidTest-results/**

@@ -24,19 +24,29 @@ jobs:
       STATUS_DIR: ${{ github.workspace }}/.ci-ai-architecture-status
 
     steps:
+      # 1. Checkout
       - name: Checkout repository
+        id: checkout
         uses: actions/checkout@v4
 
+      # 2. Java
       - name: Set up JDK 17
+        id: java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
+      # 3. Android SDK setup
       - name: Set up Android SDK
+        id: sdk
         uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools'
 
+      # 4. Install required SDK packages
       - name: Install Android SDK and API 35 Emulator
+        id: install_sdk
         shell: bash
         run: |
           set -euo pipefail
@@ -49,7 +59,11 @@ jobs:
             "emulator" \
             "system-images;android-35;google_apis;x86_64"
 
+          echo "Android SDK installation PASS"
+
+      # 5. Verify and extract ZIP
       - name: Verify and extract source ZIP
+        id: source
         shell: bash
         run: |
           set -euo pipefail
@@ -69,7 +83,10 @@ jobs:
 
           unzip -q "$ZIP_FILE" -d "$SOURCE_DIR"
 
-          SETTINGS_FILE="$(find "$SOURCE_DIR" -type f \( -name settings.gradle.kts -o -name settings.gradle \) -print -quit)"
+          SETTINGS_FILE="$(find "$SOURCE_DIR" -type f \( \
+            -name settings.gradle.kts -o \
+            -name settings.gradle \
+            \) -print -quit)"
 
           if [ -z "$SETTINGS_FILE" ]; then
             echo "::error::Gradle settings file not found"
@@ -86,14 +103,20 @@ jobs:
           fi
 
           echo "PROJECT_ROOT=$PROJECT_ROOT" >> "$GITHUB_ENV"
-          echo "Project root: $PROJECT_ROOT"
 
+          echo "Source extraction PASS"
+          echo "PROJECT_ROOT=$PROJECT_ROOT"
+
+      # 6. Gradle
       - name: Set up Gradle 8.11.1
+        id: gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.11.1'
 
+      # 7. Environment verification
       - name: Verify build environment
+        id: environment
         shell: bash
         run: |
           set -euo pipefail
@@ -105,8 +128,12 @@ jobs:
           test -d "$PROJECT_ROOT"
           test -d "$STATUS_DIR"
 
+          test -f "$PROJECT_ROOT/settings.gradle.kts" || \
+            test -f "$PROJECT_ROOT/settings.gradle"
+
           echo "Environment verification PASS"
 
+      # 8. Emulator and instrumentation tests
       - name: Boot API 35 Emulator and run instrumentation tests
         id: emulator
         continue-on-error: true
@@ -153,9 +180,9 @@ jobs:
             if [ -s app/build/outputs/apk/debug/app-debug.apk ]; then echo "Debug APK verification PASS"; else echo "Debug APK missing"; mark 4 FAIL; fi;
             exit 0
 
+      # 9. Static verification
       - name: Run static project verifiers
         id: static
-        if: always()
         shell: bash
         run: |
           set -euo pipefail
@@ -167,9 +194,11 @@ jobs:
           python3 scripts/verify_phase2_closeout.py
           python3 scripts/verify_build_readiness.py
 
+          echo "Static verification PASS"
+
+      # 10. Debug APK
       - name: Build Android Debug APK
         id: debug
-        if: always()
         shell: bash
         run: |
           set -euo pipefail
@@ -181,12 +210,13 @@ jobs:
           APK="app/build/outputs/apk/debug/app-debug.apk"
 
           test -s "$APK"
+
           sha256sum "$APK"
           stat -c 'APK_SIZE_BYTES=%s' "$APK"
 
+      # 11. JVM Unit Tests
       - name: Run JVM Unit Tests
         id: unit
-        if: always()
         shell: bash
         run: |
           set -euo pipefail
@@ -195,9 +225,9 @@ jobs:
 
           gradle --no-daemon --stacktrace :app:testDebugUnitTest
 
+      # 12. Android Lint
       - name: Run Android Lint
         id: lint
-        if: always()
         shell: bash
         run: |
           set -euo pipefail
@@ -206,9 +236,9 @@ jobs:
 
           gradle --no-daemon --stacktrace :app:lintDebug
 
+      # 13. Output verification
       - name: Verify APK and test reports
         id: outputs
-        if: always()
         shell: bash
         run: |
           set -u
@@ -227,7 +257,12 @@ jobs:
           fi
 
           XML_COUNT="$(find app/build/test-results -type f -name 'TEST-*.xml' 2>/dev/null | wc -l | tr -d ' ')"
+
           echo "JVM_TEST_XML_COUNT=$XML_COUNT"
+
+          if [ "$XML_COUNT" -eq 0 ]; then
+            echo "::warning::No JVM test XML reports found"
+          fi
 
           if [ -f "$STATUS_DIR/part-5.txt" ] && \
              [ "$(cat "$STATUS_DIR/part-5.txt")" = "PASS" ]; then
@@ -239,10 +274,18 @@ jobs:
 
           exit "$RESULT"
 
+      # 14. Final CI report
       - name: Final CI result
         if: always()
         shell: bash
         env:
+          CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
+          JAVA_OUTCOME: ${{ steps.java.outcome }}
+          SDK_OUTCOME: ${{ steps.sdk.outcome }}
+          INSTALL_SDK_OUTCOME: ${{ steps.install_sdk.outcome }}
+          SOURCE_OUTCOME: ${{ steps.source.outcome }}
+          GRADLE_OUTCOME: ${{ steps.gradle.outcome }}
+          ENVIRONMENT_OUTCOME: ${{ steps.environment.outcome }}
           EMULATOR_OUTCOME: ${{ steps.emulator.outcome }}
           STATIC_OUTCOME: ${{ steps.static.outcome }}
           DEBUG_OUTCOME: ${{ steps.debug.outcome }}
@@ -272,20 +315,34 @@ jobs:
             fi
           done
 
+          echo "CHECKOUT=$CHECKOUT_OUTCOME"
+          echo "JAVA=$JAVA_OUTCOME"
+          echo "ANDROID_SDK_SETUP=$SDK_OUTCOME"
+          echo "SDK_INSTALL=$INSTALL_SDK_OUTCOME"
+          echo "SOURCE_EXTRACTION=$SOURCE_OUTCOME"
+          echo "GRADLE_SETUP=$GRADLE_OUTCOME"
+          echo "ENVIRONMENT=$ENVIRONMENT_OUTCOME"
+          echo "EMULATOR=$EMULATOR_OUTCOME"
           echo "STATIC=$STATIC_OUTCOME"
           echo "DEBUG_BUILD=$DEBUG_OUTCOME"
           echo "JVM_UNIT_TESTS=$UNIT_OUTCOME"
           echo "ANDROID_LINT=$LINT_OUTCOME"
           echo "OUTPUT_VERIFICATION=$OUTPUTS_OUTCOME"
-          echo "EMULATOR_ACTION=$EMULATOR_OUTCOME"
 
           for VALUE in \
+            "$CHECKOUT_OUTCOME" \
+            "$JAVA_OUTCOME" \
+            "$SDK_OUTCOME" \
+            "$INSTALL_SDK_OUTCOME" \
+            "$SOURCE_OUTCOME" \
+            "$GRADLE_OUTCOME" \
+            "$ENVIRONMENT_OUTCOME" \
+            "$EMULATOR_OUTCOME" \
             "$STATIC_OUTCOME" \
             "$DEBUG_OUTCOME" \
             "$UNIT_OUTCOME" \
             "$LINT_OUTCOME" \
-            "$OUTPUTS_OUTCOME" \
-            "$EMULATOR_OUTCOME"
+            "$OUTPUTS_OUTCOME"
           do
             if [ "$VALUE" != "success" ]; then
               RESULT=1
@@ -300,6 +357,7 @@ jobs:
 
           exit "$RESULT"
 
+      # 15. Upload reports and diagnostics
       - name: Upload APK, reports, and emulator diagnostics
         if: always()
         uses: actions/upload-artifact@v4
@@ -307,8 +365,8 @@ jobs:
           name: ai-architecture-phase2-ci-diagnostics
           if-no-files-found: warn
           path: |
-            ${{ github.workspace }}/.ci-ai-architecture-source/**/app/build/outputs/apk/debug/*.apk
-            ${{ github.workspace }}/.ci-ai-architecture-source/**/app/build/reports/**
-            ${{ github.workspace }}/.ci-ai-architecture-source/**/app/build/test-results/**
-            ${{ github.workspace }}/.ci-ai-architecture-source/**/app/build/outputs/androidTest-results/**
-            ${{ github.workspace }}/.ci-ai-architecture-status/**
+            .ci-ai-architecture-source/**/app/build/outputs/apk/debug/*.apk
+            .ci-ai-architecture-source/**/app/build/reports/**
+            .ci-ai-architecture-source/**/app/build/test-results/**
+            .ci-ai-architecture-source/**/app/build/outputs/androidTest-results/**
+            .ci-ai-architecture-status/**

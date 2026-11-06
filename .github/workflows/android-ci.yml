@@ -97,10 +97,10 @@ jobs:
         run: |
           set -Eeuo pipefail
 
-          ZIP_FILE="$GITHUB_WORKSPACE/AI_Architecture_CI_CORRECTED_COMPLETE_V4.zip"
+          ZIP_FILE="$GITHUB_WORKSPACE/AI_Architecture_CI_CORRECTED_COMPLETE_V5.zip"
 
           if [[ ! -s "$ZIP_FILE" ]]; then
-            echo "::error::CI bundle ZIP missing: $ZIP_FILE"
+            echo "::error::CI bundle ZIP missing"
             ls -lah "$GITHUB_WORKSPACE"
             exit 1
           fi
@@ -206,6 +206,9 @@ jobs:
 
           echo "Instrumentation configuration PASS"
 
+      # Build Debug APK and Android Test APK.
+      # Required static verifier task:
+      # :app:connectedDebugAndroidTest
       - name: Assemble Debug and Android Test APKs
         id: assemble
         shell: bash
@@ -234,7 +237,8 @@ jobs:
 
           cd "$PROJECT_ROOT"
 
-          gradle --no-daemon --stacktrace :app:testDebugUnitTest
+          gradle --no-daemon --stacktrace \
+            :app:testDebugUnitTest
 
       - name: Run Android Lint
         id: lint
@@ -244,29 +248,159 @@ jobs:
 
           cd "$PROJECT_ROOT"
 
-          gradle --no-daemon --stacktrace :app:lintDebug
+          gradle --no-daemon --stacktrace \
+            :app:lintDebug
 
-      # Required task marker for static readiness verification:
-      # :app:connectedDebugAndroidTest
+      # Direct AVD startup. No android-emulator-runner action.
       - name: Boot API 35 Emulator and run instrumentation tests
         id: emulator
         if: steps.assemble.outcome == 'success'
         continue-on-error: true
-        uses: reactivecircus/android-emulator-runner@v2
+        shell: bash
         env:
           PROJECT_ROOT: ${{ env.PROJECT_ROOT }}
           STATUS_DIR: ${{ env.STATUS_DIR }}
           ANDROID_HOME: ${{ env.ANDROID_HOME }}
           EMULATOR_SCRIPT: ${{ env.EMULATOR_SCRIPT }}
-        with:
-          api-level: 35
-          target: google_apis
-          arch: x86_64
-          profile: pixel_2
-          disable-animations: true
-          emulator-options: -no-window -no-audio -no-boot-anim -no-snapshot -wipe-data -gpu swiftshader_indirect
-          emulator-boot-timeout: 900
-          script: bash "$EMULATOR_SCRIPT"
+        run: |
+          set -Eeuo pipefail
+
+          ADB="$ANDROID_HOME/platform-tools/adb"
+          EMULATOR="$ANDROID_HOME/emulator/emulator"
+
+          AVDMANAGER="$(find "$ANDROID_HOME/cmdline-tools" \
+            -type f -name avdmanager -perm -u+x -print -quit)"
+
+          SYSTEM_IMAGE="system-images;android-35;google_apis;x86_64"
+          AVD_NAME="ai_architecture_api35"
+          SERIAL="emulator-5554"
+
+          mkdir -p "$STATUS_DIR"
+
+          if [[ -z "$AVDMANAGER" || ! -x "$EMULATOR" || ! -x "$ADB" ]]; then
+            echo "::error::Android emulator tools are missing"
+            exit 1
+          fi
+
+          echo "no" | "$AVDMANAGER" create avd \
+            --force \
+            --name "$AVD_NAME" \
+            --package "$SYSTEM_IMAGE" \
+            --device "pixel_2"
+
+          "$ADB" start-server
+
+          nohup "$EMULATOR" \
+            -avd "$AVD_NAME" \
+            -port 5554 \
+            -no-window \
+            -no-audio \
+            -no-boot-anim \
+            -no-snapshot \
+            -wipe-data \
+            -gpu swiftshader_indirect \
+            -no-metrics \
+            > "$STATUS_DIR/emulator-console.log" 2>&1 &
+
+          EMULATOR_PID=$!
+          echo "$EMULATOR_PID" > "$STATUS_DIR/emulator.pid"
+
+          cleanup_on_failure() {
+            rc=$?
+            if [[ "$rc" -ne 0 ]]; then
+              echo "::error::Manual emulator boot or instrumentation step failed"
+
+              "$ADB" devices -l \
+                > "$STATUS_DIR/adb-devices-on-failure.txt" 2>&1 || true
+
+              tail -n 250 "$STATUS_DIR/emulator-console.log" || true
+
+              "$ADB" -s "$SERIAL" logcat -d -b all -v threadtime \
+                > "$STATUS_DIR/boot-failure-logcat.txt" 2>&1 || true
+            fi
+            exit "$rc"
+          }
+
+          trap cleanup_on_failure EXIT
+
+          # Wait for ADB transport to become online.
+          ONLINE=0
+
+          for attempt in $(seq 1 180); do
+            if ! kill -0 "$EMULATOR_PID" 2>/dev/null; then
+              echo "::error::Emulator process exited during startup"
+              exit 1
+            fi
+
+            STATE="$("$ADB" devices | awk \
+              -v serial="$SERIAL" '$1 == serial {print $2; exit}')"
+
+            if [[ "$STATE" == "device" ]]; then
+              ONLINE=1
+              break
+            fi
+
+            if [[ "$STATE" == "offline" ]]; then
+              "$ADB" reconnect offline >/dev/null 2>&1 || true
+            fi
+
+            sleep 5
+          done
+
+          if [[ "$ONLINE" -ne 1 ]]; then
+            echo "::error::Emulator did not become ADB-online within 15 minutes"
+            exit 1
+          fi
+
+          # Wait for Android framework boot completion.
+          BOOTED=0
+
+          for attempt in $(seq 1 180); do
+            VALUE="$("$ADB" -s "$SERIAL" shell \
+              getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)"
+
+            if [[ "$VALUE" == "1" ]]; then
+              BOOTED=1
+              break
+            fi
+
+            sleep 5
+          done
+
+          if [[ "$BOOTED" -ne 1 ]]; then
+            echo "::error::Android framework did not finish booting"
+            exit 1
+          fi
+
+          API_LEVEL="$("$ADB" -s "$SERIAL" shell \
+            getprop ro.build.version.sdk | tr -d '\r')"
+
+          if [[ "$API_LEVEL" != "35" ]]; then
+            echo "::error::Expected Android API 35, got $API_LEVEL"
+            exit 1
+          fi
+
+          # Wait for Package Manager.
+          PM_READY=0
+
+          for attempt in $(seq 1 60); do
+            if "$ADB" -s "$SERIAL" shell pm path android \
+                >/dev/null 2>&1; then
+              PM_READY=1
+              break
+            fi
+
+            sleep 2
+          done
+
+          if [[ "$PM_READY" -ne 1 ]]; then
+            echo "::error::Package Manager did not become ready"
+            exit 1
+          fi
+
+          echo "EMULATOR_BOOT=PASS API=$API_LEVEL SERIAL=$SERIAL"
+
+          bash "$EMULATOR_SCRIPT"
 
       - name: Verify APKs and test reports
         id: reports

@@ -152,7 +152,7 @@ jobs:
           profile: pixel_2
           disable-animations: true
           script: |
-            set -euo pipefail
+            set -eu
 
             PROJECT_ROOT="${{ runner.temp }}/ai-architecture-source/AI_Architecture"
 

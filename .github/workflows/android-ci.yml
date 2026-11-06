@@ -67,7 +67,7 @@ jobs:
           unzip -t "$ZIP_FILE"
           echo "ZIP integrity PASS"
 
-      # 6. Extract ZIP and detect Android project
+      # 6. Extract ZIP and detect project root
       - name: Extract ZIP and detect project root
         shell: bash
         run: |
@@ -112,7 +112,7 @@ jobs:
         with:
           gradle-version: '8.11.1'
 
-      # 8. Verify environment
+      # 8. Verify Java Gradle and Android SDK
       - name: Verify Java Gradle and Android SDK
         shell: bash
         run: |
@@ -132,7 +132,7 @@ jobs:
 
           echo "Environment verification PASS"
 
-      # 9. Emulator instrumentation tests FIRST
+      # 9. Emulator and instrumentation tests FIRST
       - name: Boot Emulator and run instrumentation tests FIRST
         uses: reactivecircus/android-emulator-runner@v2
         with:
@@ -140,11 +140,8 @@ jobs:
           target: google_apis
           arch: x86_64
           profile: pixel_2
-
           disable-animations: false
-
           emulator-options: -no-window -no-audio -no-boot-anim
-
           emulator-boot-timeout: 900
 
           script: >-
@@ -157,15 +154,10 @@ jobs:
             cd "$PROJECT_ROOT";
             test -f app/build.gradle.kts || test -f app/build.gradle;
             adb wait-for-device;
-            BOOTED=0;
-            for i in $(seq 1 120); do
-              BOOT_STATUS="$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)";
-              if [ "$BOOT_STATUS" = "1" ]; then BOOTED=1; break; fi;
-              sleep 5;
-            done;
-            if [ "$BOOTED" -ne 1 ]; then echo "Emulator boot verification failed"; adb devices -l; exit 1; fi;
+            BOOT_STATUS="";
+            for i in $(seq 1 120); do BOOT_STATUS="$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)"; if [ "$BOOT_STATUS" = "1" ]; then break; fi; sleep 5; done;
+            if [ "$BOOT_STATUS" != "1" ]; then echo "Emulator boot verification failed"; adb devices -l; exit 1; fi;
             echo "Emulator boot PASS";
-            adb shell input keyevent 82 || true;
             gradle --no-daemon --stacktrace :app:compileDebugAndroidTestKotlin;
             gradle --no-daemon --stacktrace :app:connectedDebugAndroidTest
 

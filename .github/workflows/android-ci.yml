@@ -48,7 +48,7 @@ jobs:
       - name: Verify uploaded ZIP
         run: |
           set -euo pipefail
-          ZIP_FILE="AI_Architecture_Phase2_ANDROID_BUILD_READY_NOT_FINAL.zip"
+          ZIP_FILE="AI_Architecture_Phase2_KOTLIN_COMPILE_FIX_V1_NOT_FINAL.zip"
           test -f "$ZIP_FILE"
           unzip -t "$ZIP_FILE"
           echo "Source ZIP integrity PASS"

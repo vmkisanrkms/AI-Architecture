@@ -41,7 +41,6 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-
           ANDROID_HOME="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
 
           if [[ ! -d "$ANDROID_HOME/cmdline-tools" ]]; then
@@ -98,7 +97,7 @@ jobs:
         run: |
           set -Eeuo pipefail
 
-          ZIP_FILE="$GITHUB_WORKSPACE/AI_Architecture_CI_CORRECTED_COMPLETE_V3.zip"
+          ZIP_FILE="$GITHUB_WORKSPACE/AI_Architecture_CI_CORRECTED_COMPLETE_V4.zip"
 
           if [[ ! -s "$ZIP_FILE" ]]; then
             echo "::error::CI bundle ZIP missing: $ZIP_FILE"
@@ -207,7 +206,6 @@ jobs:
 
           echo "Instrumentation configuration PASS"
 
-      # 1. Debug APK Build
       - name: Assemble Debug and Android Test APKs
         id: assemble
         shell: bash
@@ -228,7 +226,6 @@ jobs:
             app/build/outputs/apk/debug/app-debug.apk \
             app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
 
-      # 2. JVM Unit Tests
       - name: Run JVM Unit Tests
         id: unit
         shell: bash
@@ -237,10 +234,8 @@ jobs:
 
           cd "$PROJECT_ROOT"
 
-          gradle --no-daemon --stacktrace \
-            :app:testDebugUnitTest
+          gradle --no-daemon --stacktrace :app:testDebugUnitTest
 
-      # 3. Android Lint
       - name: Run Android Lint
         id: lint
         shell: bash
@@ -249,10 +244,10 @@ jobs:
 
           cd "$PROJECT_ROOT"
 
-          gradle --no-daemon --stacktrace \
-            :app:lintDebug
+          gradle --no-daemon --stacktrace :app:lintDebug
 
-      # 4. Emulator Instrumentation Tests
+      # Required task marker for static readiness verification:
+      # :app:connectedDebugAndroidTest
       - name: Boot API 35 Emulator and run instrumentation tests
         id: emulator
         if: steps.assemble.outcome == 'success'

@@ -45,45 +45,54 @@ jobs:
             "platform-tools" \
             "emulator"
 
-      - name: Verify uploaded ZIP
+      - name: Verify V1 source ZIP
         run: |
           set -euo pipefail
-          ZIP_FILE="AI_Architecture_Phase2_KOTLIN_COMPILE_FIX_V1_NOT_FINAL.zip"
-          test -f "$ZIP_FILE"
-          unzip -t "$ZIP_FILE"
-          echo "Source ZIP integrity PASS"
 
-      - name: Extract uploaded Phase 2 source ZIP
+          ZIP_FILE="AI_Architecture_Phase2_KOTLIN_COMPILE_FIX_V1_NOT_FINAL.zip"
+
+          if [ ! -f "$ZIP_FILE" ]; then
+            echo "::error::V1 source ZIP not found: $ZIP_FILE"
+            ls -la
+            exit 1
+          fi
+
+          unzip -t "$ZIP_FILE"
+          echo "V1 ZIP integrity PASS"
+
+      - name: Extract V1 Android source
         run: |
           set -euo pipefail
+
+          ZIP_FILE="AI_Architecture_Phase2_KOTLIN_COMPILE_FIX_V1_NOT_FINAL.zip"
 
           mkdir -p "$RUNNER_TEMP/ai-architecture-source"
 
-          unzip -q \
-            "AI_Architecture_Phase2_ANDROID_BUILD_READY_NOT_FINAL.zip" \
+          unzip -q "$ZIP_FILE" \
             -d "$RUNNER_TEMP/ai-architecture-source"
 
           PROJECT_ROOT="$RUNNER_TEMP/ai-architecture-source/AI_Architecture"
 
           if [ ! -d "$PROJECT_ROOT" ]; then
-            echo "::error::Expected AI_Architecture project folder not found."
+            echo "::error::AI_Architecture project directory not found"
             find "$RUNNER_TEMP/ai-architecture-source" -maxdepth 3 -type f
             exit 1
           fi
 
-          if [ ! -f "$PROJECT_ROOT/settings.gradle.kts" ] && \
-             [ ! -f "$PROJECT_ROOT/settings.gradle" ]; then
-            echo "::error::Gradle settings file missing."
+          if [ ! -f "$PROJECT_ROOT/settings.gradle.kts" ]; then
+            echo "::error::settings.gradle.kts missing"
             exit 1
           fi
 
-          if [ ! -d "$PROJECT_ROOT/app" ]; then
-            echo "::error::Android app module missing."
+          if [ ! -f "$PROJECT_ROOT/app/build.gradle.kts" ]; then
+            echo "::error::app/build.gradle.kts missing"
             exit 1
           fi
 
           echo "PROJECT_ROOT=$PROJECT_ROOT" >> "$GITHUB_ENV"
-          echo "Project extraction PASS"
+
+          echo "Android project root verified:"
+          echo "$PROJECT_ROOT"
 
       - name: Set up Gradle 8.11.1
         uses: gradle/actions/setup-gradle@v4
@@ -93,14 +102,19 @@ jobs:
       - name: Verify Java Gradle and Android SDK
         run: |
           set -euo pipefail
+
           java -version
           gradle --version
           sdkmanager --list_installed
-          test -d "$PROJECT_ROOT"
 
-      - name: Run project static verifiers
+          test -d "$PROJECT_ROOT"
+          test -f "$PROJECT_ROOT/settings.gradle.kts"
+          test -f "$PROJECT_ROOT/app/build.gradle.kts"
+
+      - name: Run all static project verifiers
         run: |
           set -euo pipefail
+
           cd "$PROJECT_ROOT"
 
           python3 scripts/verify_project.py
@@ -112,18 +126,21 @@ jobs:
         run: |
           set -euo pipefail
           cd "$PROJECT_ROOT"
+
           gradle --no-daemon --stacktrace :app:assembleDebug
 
       - name: Run unit tests
         run: |
           set -euo pipefail
           cd "$PROJECT_ROOT"
+
           gradle --no-daemon --stacktrace :app:testDebugUnitTest
 
       - name: Run Android lint
         run: |
           set -euo pipefail
           cd "$PROJECT_ROOT"
+
           gradle --no-daemon --stacktrace :app:lintDebug
 
       - name: Run emulator instrumentation tests
@@ -137,11 +154,11 @@ jobs:
             cd "$PROJECT_ROOT"
             gradle --no-daemon --stacktrace :app:connectedDebugAndroidTest
 
-      - name: Upload debug APK and test reports
+      - name: Upload APK and test reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ai-architecture-phase2-debug-build-and-reports
+          name: ai-architecture-phase2-v1-debug-and-reports
           if-no-files-found: warn
           path: |
             ${{ runner.temp }}/ai-architecture-source/AI_Architecture/app/build/outputs/apk/debug/*.apk

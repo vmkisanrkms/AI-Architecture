@@ -37,6 +37,7 @@ jobs:
           packages: platform-tools emulator
 
       - name: Install Android platform and build tools
+        shell: bash
         run: |
           set -euo pipefail
           sdkmanager --install \
@@ -46,6 +47,7 @@ jobs:
             "emulator"
 
       - name: Verify V1 source ZIP
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -60,33 +62,39 @@ jobs:
           unzip -t "$ZIP_FILE"
           echo "V1 ZIP integrity PASS"
 
-      - name: Extract V1 Android source
+      - name: Extract and locate Android project
+        shell: bash
         run: |
           set -euo pipefail
 
           ZIP_FILE="AI_Architecture_Phase2_UNIT_TEST_FIX_V1_NOT_FINAL.zip"
           SOURCE_DIR="$RUNNER_TEMP/ai-architecture-source"
-          PROJECT_ROOT="$SOURCE_DIR/AI_Architecture"
 
           rm -rf "$SOURCE_DIR"
           mkdir -p "$SOURCE_DIR"
 
           unzip -q "$ZIP_FILE" -d "$SOURCE_DIR"
 
-          if [ ! -d "$PROJECT_ROOT" ]; then
-            echo "::error::AI_Architecture project directory not found"
-            find "$SOURCE_DIR" -maxdepth 4 -type f
+          echo "Searching for Gradle settings file..."
+
+          SETTINGS_FILE="$(find "$SOURCE_DIR" -type f \( \
+            -name settings.gradle.kts -o \
+            -name settings.gradle \
+          \) -print -quit)"
+
+          if [ -z "$SETTINGS_FILE" ]; then
+            echo "::error::No Gradle settings file found in ZIP"
+            find "$SOURCE_DIR" -maxdepth 6 -type f
             exit 1
           fi
 
-          if [ ! -f "$PROJECT_ROOT/settings.gradle.kts" ]; then
-            echo "::error::settings.gradle.kts missing"
-            find "$SOURCE_DIR" -maxdepth 4 -name "settings.gradle*"
-            exit 1
-          fi
+          PROJECT_ROOT="$(dirname "$SETTINGS_FILE")"
 
-          if [ ! -f "$PROJECT_ROOT/app/build.gradle.kts" ]; then
-            echo "::error::app/build.gradle.kts missing"
+          if [ ! -f "$PROJECT_ROOT/app/build.gradle.kts" ] && \
+             [ ! -f "$PROJECT_ROOT/app/build.gradle" ]; then
+            echo "::error::Android app Gradle file not found"
+            echo "Detected project root: $PROJECT_ROOT"
+            find "$PROJECT_ROOT" -maxdepth 4 -type f
             exit 1
           fi
 
@@ -101,6 +109,7 @@ jobs:
           gradle-version: '8.11.1'
 
       - name: Verify Java Gradle and Android SDK
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -109,10 +118,14 @@ jobs:
           sdkmanager --list_installed
 
           test -d "$PROJECT_ROOT"
-          test -f "$PROJECT_ROOT/settings.gradle.kts"
-          test -f "$PROJECT_ROOT/app/build.gradle.kts"
+          test -f "$PROJECT_ROOT/settings.gradle.kts" || \
+            test -f "$PROJECT_ROOT/settings.gradle"
+
+          test -f "$PROJECT_ROOT/app/build.gradle.kts" || \
+            test -f "$PROJECT_ROOT/app/build.gradle"
 
       - name: Run all static project verifiers
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -124,6 +137,7 @@ jobs:
           python3 scripts/verify_build_readiness.py
 
       - name: Android debug build
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -131,6 +145,7 @@ jobs:
           gradle --no-daemon --stacktrace :app:assembleDebug
 
       - name: Run unit tests
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -138,6 +153,7 @@ jobs:
           gradle --no-daemon --stacktrace :app:testDebugUnitTest
 
       - name: Run Android lint
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -154,15 +170,37 @@ jobs:
           script: |
             set -eu
 
-            PROJECT_ROOT="${{ runner.temp }}/ai-architecture-source/AI_Architecture"
+            SOURCE_DIR="${{ runner.temp }}/ai-architecture-source"
 
-            echo "Checking Android project directory:"
+            echo "Searching for Android Gradle project..."
+
+            SETTINGS_FILE="$(find "$SOURCE_DIR" -type f \( \
+              -name settings.gradle.kts -o \
+              -name settings.gradle \
+            \) -print -quit)"
+
+            if [ -z "$SETTINGS_FILE" ]; then
+              echo "ERROR: Gradle settings file not found"
+              find "$SOURCE_DIR" -maxdepth 6 -type f
+              exit 1
+            fi
+
+            PROJECT_ROOT="$(dirname "$SETTINGS_FILE")"
+
+            echo "Detected project root:"
             echo "$PROJECT_ROOT"
 
             cd "$PROJECT_ROOT"
 
-            test -f settings.gradle.kts
-            test -f app/build.gradle.kts
+            if [ ! -f app/build.gradle.kts ] && \
+               [ ! -f app/build.gradle ]; then
+              echo "ERROR: Android app Gradle file not found"
+              find . -maxdepth 4 -type f
+              exit 1
+            fi
+
+            echo "Waiting for Android emulator..."
+            adb wait-for-device
 
             gradle --no-daemon --stacktrace :app:connectedDebugAndroidTest
 
@@ -173,7 +211,7 @@ jobs:
           name: ai-architecture-phase2-v1-debug-and-reports
           if-no-files-found: warn
           path: |
-            ${{ runner.temp }}/ai-architecture-source/AI_Architecture/app/build/outputs/apk/debug/*.apk
-            ${{ runner.temp }}/ai-architecture-source/AI_Architecture/app/build/reports/**
-            ${{ runner.temp }}/ai-architecture-source/AI_Architecture/app/build/test-results/**
-            ${{ runner.temp }}/ai-architecture-source/AI_Architecture/app/build/outputs/androidTest-results/**
+            ${{ runner.temp }}/ai-architecture-source/**/app/build/outputs/apk/debug/*.apk
+            ${{ runner.temp }}/ai-architecture-source/**/app/build/reports/**
+            ${{ runner.temp }}/ai-architecture-source/**/app/build/test-results/**
+            ${{ runner.temp }}/ai-architecture-source/**/app/build/outputs/androidTest-results/**

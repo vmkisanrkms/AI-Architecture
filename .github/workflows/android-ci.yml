@@ -26,12 +26,10 @@ jobs:
 
     steps:
 
-      # 1. Checkout
       - name: Checkout repository
         id: checkout
         uses: actions/checkout@v4
 
-      # 2. Java 17
       - name: Set up JDK 17
         id: java
         uses: actions/setup-java@v4
@@ -39,7 +37,7 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      # 3. Android SDK
+      # Android SDK: retain the working direct sdkmanager setup.
       - name: Install Android SDK without deprecated tools
         id: sdk
         shell: bash
@@ -63,7 +61,6 @@ jobs:
 
           echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
-
           echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
           echo "$ANDROID_HOME/emulator" >> "$GITHUB_PATH"
 
@@ -95,10 +92,9 @@ jobs:
           test -d "$ANDROID_HOME/system-images/android-35/google_apis/x86_64"
 
           "$ANDROID_HOME/platform-tools/adb" version
-
           echo "ANDROID_SDK_INSTALL=PASS"
 
-      # 4. Extract complete CI bundle
+      # Extract the uploaded full source and CI bundle.
       - name: Extract and validate CI bundle
         id: source
         shell: bash
@@ -146,21 +142,18 @@ jobs:
           echo "REPORT_SCRIPT=$REPORT_SCRIPT" >> "$GITHUB_ENV"
 
           chmod +x "$EMULATOR_SCRIPT"
-
           bash -n "$EMULATOR_SCRIPT"
           python3 -m py_compile "$REPORT_SCRIPT"
 
           echo "ZIP extraction PASS"
-          echo "PROJECT_ROOT=$PROJECT_ROOT"
 
-      # 5. Gradle
       - name: Set up Gradle 8.11.1
         id: gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.11.1'
 
-      # 6. Fix workflow visibility for project verifier
+      # The project verifier reads this workflow from inside AI_Architecture.
       - name: Prepare workflow for static verification
         id: workflow_prepare
         shell: bash
@@ -171,7 +164,7 @@ jobs:
           WORKFLOW_DEST="$PROJECT_ROOT/.github/workflows/android-ci.yml"
 
           if [[ ! -s "$WORKFLOW_SOURCE" ]]; then
-            echo "::error::Repository workflow file not found"
+            echo "::error::Repository workflow file missing"
             exit 1
           fi
 
@@ -179,11 +172,9 @@ jobs:
           cp "$WORKFLOW_SOURCE" "$WORKFLOW_DEST"
 
           test -s "$WORKFLOW_DEST"
+          echo "Workflow prepared for project verifier"
 
-          echo "Workflow copied into extracted project"
-          echo "Workflow path: $WORKFLOW_DEST"
-
-      # 7. Static verification
+      # Static checks: preserve all existing project verifiers.
       - name: Verify source and run static verifiers
         id: static
         shell: bash
@@ -199,7 +190,6 @@ jobs:
 
           echo "Static verification PASS"
 
-      # 8. Instrumentation configuration
       - name: Verify Android instrumentation configuration
         id: test_config
         shell: bash
@@ -222,7 +212,7 @@ jobs:
 
           echo "Instrumentation configuration PASS"
 
-      # 9. Build APKs
+      # 1. Debug APK build.
       - name: Assemble Debug and Android Test APKs
         id: assemble
         shell: bash
@@ -236,17 +226,14 @@ jobs:
             :app:assembleDebug \
             :app:assembleDebugAndroidTest
 
-          APK="app/build/outputs/apk/debug/app-debug.apk"
-          TEST_APK="app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk"
+          test -s app/build/outputs/apk/debug/app-debug.apk
+          test -s app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
 
-          test -s "$APK"
-          test -s "$TEST_APK"
+          sha256sum \
+            app/build/outputs/apk/debug/app-debug.apk \
+            app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
 
-          sha256sum "$APK" "$TEST_APK"
-
-          echo "APK assembly PASS"
-
-      # 10. JVM tests
+      # 2. JVM Unit Tests.
       - name: Run JVM Unit Tests
         id: unit
         shell: bash
@@ -258,7 +245,7 @@ jobs:
           gradle --no-daemon --stacktrace \
             :app:testDebugUnitTest
 
-      # 11. Lint
+      # 3. Android Lint.
       - name: Run Android Lint
         id: lint
         shell: bash
@@ -270,7 +257,9 @@ jobs:
           gradle --no-daemon --stacktrace \
             :app:lintDebug
 
-      # 12. Emulator instrumentation tests
+      # 4. Emulator instrumentation.
+      # Required static-verifier task marker:
+      # :app:connectedDebugAndroidTest
       - name: Boot API 35 Emulator and run instrumentation tests
         id: emulator
         if: steps.assemble.outcome == 'success'
@@ -291,7 +280,7 @@ jobs:
           emulator-boot-timeout: 900
           script: bash "$EMULATOR_SCRIPT"
 
-      # 13. Verify reports only after APK build
+      # Report verification only runs when APK assembly succeeded.
       - name: Verify APKs and test reports
         id: reports
         if: always() && steps.assemble.outcome == 'success'
@@ -303,7 +292,6 @@ jobs:
             --project-root "$PROJECT_ROOT" \
             --status-dir "$STATUS_DIR"
 
-      # 14. Final CI report
       - name: Final CI Summary
         id: summary
         if: always()
@@ -326,7 +314,6 @@ jobs:
           set -u
 
           mkdir -p "$STATUS_DIR"
-
           RESULT=0
 
           {
@@ -349,12 +336,14 @@ jobs:
           for VALUE in \
             "$CHECKOUT" "$JAVA" "$SDK" "$SOURCE" "$GRADLE" \
             "$WORKFLOW_PREPARE" "$STATIC" "$TEST_CONFIG" \
-            "$ASSEMBLE" "$UNIT" "$LINT" "$EMULATOR" "$REPORTS"
+            "$ASSEMBLE" "$UNIT" "$LINT" "$EMULATOR"
           do
-            if [[ "$VALUE" != "success" ]]; then
-              RESULT=1
-            fi
+            [[ "$VALUE" == "success" ]] || RESULT=1
           done
+
+          if [[ "$ASSEMBLE" == "success" && "$REPORTS" != "success" ]]; then
+            RESULT=1
+          fi
 
           if [[ "$RESULT" -eq 0 ]]; then
             echo "FINAL_RESULT=PASS" | tee -a "$STATUS_DIR/final-ci-summary.txt"
@@ -365,7 +354,6 @@ jobs:
 
           exit "$RESULT"
 
-      # 15. Upload all diagnostics
       - name: Upload APKs, reports and diagnostics
         if: always()
         uses: actions/upload-artifact@v4

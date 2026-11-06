@@ -1,1 +1,83 @@
 
+
+name: AI Architecture Phase 2 Android CI (ZIP upload)
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform and build tools
+        run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0' 'platform-tools'
+
+      - name: Set up Gradle 8.11.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Extract uploaded Phase 2 source ZIP
+        run: |
+          set -euo pipefail
+          test -f AI_Architecture_Phase2_ANDROID_BUILD_READY_NOT_FINAL.zip
+          mkdir -p "$RUNNER_TEMP/ai-architecture-source"
+          unzip -q AI_Architecture_Phase2_ANDROID_BUILD_READY_NOT_FINAL.zip -d "$RUNNER_TEMP/ai-architecture-source"
+          echo "PROJECT_ROOT=$RUNNER_TEMP/ai-architecture-source/AI_Architecture" >> "$GITHUB_ENV"
+
+      - name: Verify source and build configuration
+        run: |
+          python3 "$PROJECT_ROOT/scripts/verify_project.py"
+          python3 "$PROJECT_ROOT/scripts/verify_phase2.py"
+          python3 "$PROJECT_ROOT/scripts/verify_phase2_closeout.py"
+          python3 "$PROJECT_ROOT/scripts/verify_build_readiness.py"
+
+      - name: Android debug build
+        run: cd "$PROJECT_ROOT" && gradle --no-daemon --stacktrace :app:assembleDebug
+
+      - name: Run all unit tests
+        run: cd "$PROJECT_ROOT" && gradle --no-daemon --stacktrace :app:testDebugUnitTest
+
+      - name: Run Android lint
+        run: cd "$PROJECT_ROOT" && gradle --no-daemon --stacktrace :app:lintDebug
+
+      - name: Run emulator instrumentation tests
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 36
+          arch: x86_64
+          profile: pixel_2
+          disable-animations: true
+          script: cd "$PROJECT_ROOT" && gradle --no-daemon --stacktrace :app:connectedDebugAndroidTest
+
+      - name: Upload debug APK and test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-architecture-phase2-debug-build-and-reports
+          path: |
+            ${{ runner.temp }}/ai-architecture-source/AI_Architecture/app/build/outputs/apk/debug/*.apk
+            ${{ runner.temp }}/ai-architecture-source/AI_Architecture/app/build/reports/**
+            ${{ runner.temp }}/ai-architecture-source/AI_Architecture/app/build/test-results/**
+            ${{ runner.temp }}/ai-architecture-source/AI_Architecture/app/build/outputs/androidTest-results/**
+          if-no-files-found: warn

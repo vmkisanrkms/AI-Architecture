@@ -170,50 +170,7 @@ jobs:
           profile: pixel_2
           disable-animations: true
           script: |
-            set -eu
-
-            SOURCE_DIR="${{ runner.temp }}/ai-architecture-source"
-
-            echo "Searching for Gradle project..."
-
-            SETTINGS_FILE="$(find "$SOURCE_DIR" -type f -name settings.gradle.kts -print -quit)"
-
-            if [ -z "$SETTINGS_FILE" ]; then
-              SETTINGS_FILE="$(find "$SOURCE_DIR" -type f -name settings.gradle -print -quit)"
-            fi
-
-            if [ -z "$SETTINGS_FILE" ]; then
-              echo "ERROR: Gradle settings file not found"
-              find "$SOURCE_DIR" -maxdepth 7 -type f
-              exit 1
-            fi
-
-            PROJECT_ROOT="$(dirname "$SETTINGS_FILE")"
-
-            echo "Detected project root:"
-            echo "$PROJECT_ROOT"
-
-            cd "$PROJECT_ROOT"
-
-            if [ ! -f app/build.gradle.kts ] && [ ! -f app/build.gradle ]; then
-              echo "ERROR: Android app Gradle file not found"
-              exit 1
-            fi
-
-            echo "Checking emulator..."
-            adb devices
-            adb wait-for-device
-
-            BOOT_STATUS="$(adb shell getprop sys.boot_completed)"
-
-            if [ "$BOOT_STATUS" != "1" ]; then
-              echo "ERROR: Emulator boot not completed"
-              exit 1
-            fi
-
-            echo "Starting instrumentation tests..."
-
-            gradle --no-daemon --stacktrace :app:connectedDebugAndroidTest
+            cd "$PROJECT_ROOT" && test -f settings.gradle.kts && test -f app/build.gradle.kts && adb wait-for-device && gradle --no-daemon --stacktrace :app:connectedDebugAndroidTest
 
       - name: Upload APK and test reports
         if: always()

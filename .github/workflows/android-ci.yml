@@ -20,8 +20,8 @@ jobs:
     timeout-minutes: 120
 
     env:
-      SOURCE_DIR: ${{ runner.temp }}/ai-architecture-source
-      STATUS_DIR: ${{ runner.temp }}/ai-architecture-status
+      SOURCE_DIR: ${{ github.workspace }}/.ci-ai-architecture-source
+      STATUS_DIR: ${{ github.workspace }}/.ci-ai-architecture-status
 
     steps:
       - name: Checkout repository
@@ -122,13 +122,13 @@ jobs:
 
           script: >-
             set +e;
-            cd "${{ runner.temp }}/ai-architecture-source";
+            cd "${{ github.workspace }}/.ci-ai-architecture-source";
             SETTINGS_FILE="$(find . -type f -name settings.gradle.kts -print -quit)";
             if [ -z "$SETTINGS_FILE" ]; then SETTINGS_FILE="$(find . -type f -name settings.gradle -print -quit)"; fi;
             if [ -z "$SETTINGS_FILE" ]; then echo "Project settings missing"; exit 1; fi;
             PROJECT_ROOT="$(dirname "$SETTINGS_FILE")";
             cd "$PROJECT_ROOT";
-            STATUS_DIR="${{ runner.temp }}/ai-architecture-status";
+            STATUS_DIR="${{ github.workspace }}/.ci-ai-architecture-status";
             mark() { printf '%s\n' "$2" > "$STATUS_DIR/part-$1.txt"; };
             diagnostics() {
               DIAG_OK=1;
@@ -307,8 +307,8 @@ jobs:
           name: ai-architecture-phase2-ci-diagnostics
           if-no-files-found: warn
           path: |
-            ${{ runner.temp }}/ai-architecture-source/**/app/build/outputs/apk/debug/*.apk
-            ${{ runner.temp }}/ai-architecture-source/**/app/build/reports/**
-            ${{ runner.temp }}/ai-architecture-source/**/app/build/test-results/**
-            ${{ runner.temp }}/ai-architecture-source/**/app/build/outputs/androidTest-results/**
-            ${{ runner.temp }}/ai-architecture-status/**
+            ${{ github.workspace }}/.ci-ai-architecture-source/**/app/build/outputs/apk/debug/*.apk
+            ${{ github.workspace }}/.ci-ai-architecture-source/**/app/build/reports/**
+            ${{ github.workspace }}/.ci-ai-architecture-source/**/app/build/test-results/**
+            ${{ github.workspace }}/.ci-ai-architecture-source/**/app/build/outputs/androidTest-results/**
+            ${{ github.workspace }}/.ci-ai-architecture-status/**

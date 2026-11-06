@@ -34,7 +34,7 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
         with:
-          packages: 'platform-tools'
+          packages: platform-tools
 
       - name: Install Android platform and build tools
         shell: bash
@@ -75,8 +75,6 @@ jobs:
 
           unzip -q "$ZIP_FILE" -d "$SOURCE_DIR"
 
-          echo "Searching for Gradle settings..."
-
           SETTINGS_FILE="$(find "$SOURCE_DIR" -type f -name settings.gradle.kts -print -quit)"
 
           if [ -z "$SETTINGS_FILE" ]; then
@@ -91,18 +89,15 @@ jobs:
 
           PROJECT_ROOT="$(dirname "$SETTINGS_FILE")"
 
-          if [ ! -f "$PROJECT_ROOT/app/build.gradle.kts" ] && \
-             [ ! -f "$PROJECT_ROOT/app/build.gradle" ]; then
+          if [ ! -f "$PROJECT_ROOT/app/build.gradle.kts" ] && [ ! -f "$PROJECT_ROOT/app/build.gradle" ]; then
             echo "::error::Android app Gradle file not found"
-            echo "Detected root: $PROJECT_ROOT"
-            find "$PROJECT_ROOT" -maxdepth 4 -type f
             exit 1
           fi
 
           echo "PROJECT_ROOT=$PROJECT_ROOT" >> "$GITHUB_ENV"
+          echo "SOURCE_DIR=$SOURCE_DIR" >> "$GITHUB_ENV"
 
-          echo "Android project root verified:"
-          echo "$PROJECT_ROOT"
+          echo "Project root verified: $PROJECT_ROOT"
 
       - name: Set up Gradle 8.11.1
         uses: gradle/actions/setup-gradle@v4
@@ -119,12 +114,8 @@ jobs:
           sdkmanager --list_installed
 
           test -d "$PROJECT_ROOT"
-
-          test -f "$PROJECT_ROOT/settings.gradle.kts" || \
-            test -f "$PROJECT_ROOT/settings.gradle"
-
-          test -f "$PROJECT_ROOT/app/build.gradle.kts" || \
-            test -f "$PROJECT_ROOT/app/build.gradle"
+          test -f "$PROJECT_ROOT/settings.gradle.kts" || test -f "$PROJECT_ROOT/settings.gradle"
+          test -f "$PROJECT_ROOT/app/build.gradle.kts" || test -f "$PROJECT_ROOT/app/build.gradle"
 
       - name: Run all static project verifiers
         shell: bash
@@ -164,16 +155,58 @@ jobs:
 
       - name: Run emulator instrumentation tests
         uses: reactivecircus/android-emulator-runner@v2
+        env:
+          SOURCE_DIR: ${{ runner.temp }}/ai-architecture-source
         with:
           api-level: 36
           arch: x86_64
           profile: pixel_2
           disable-animations: true
           script: |
-            cd "$PROJECT_ROOT" && \
-            test -f settings.gradle.kts && \
-            test -f app/build.gradle.kts && \
-            adb wait-for-device && \
+            set -eu
+
+            echo "Finding Android Gradle project..."
+
+            if [ -z "${SOURCE_DIR:-}" ]; then
+              echo "ERROR: SOURCE_DIR is empty"
+              exit 1
+            fi
+
+            SETTINGS_FILE=$(find "$SOURCE_DIR" -type f -name settings.gradle.kts -print -quit)
+
+            if [ -z "$SETTINGS_FILE" ]; then
+              SETTINGS_FILE=$(find "$SOURCE_DIR" -type f -name settings.gradle -print -quit)
+            fi
+
+            if [ -z "$SETTINGS_FILE" ]; then
+              echo "ERROR: Gradle settings file not found"
+              exit 1
+            fi
+
+            PROJECT_ROOT=$(dirname "$SETTINGS_FILE")
+
+            echo "Project root: $PROJECT_ROOT"
+
+            cd "$PROJECT_ROOT"
+
+            if [ ! -f app/build.gradle.kts ] && [ ! -f app/build.gradle ]; then
+              echo "ERROR: Android app Gradle file missing"
+              exit 1
+            fi
+
+            echo "Checking emulator connection..."
+            adb wait-for-device
+
+            BOOT_STATUS=$(adb shell getprop sys.boot_completed | tr -d '\r')
+
+            if [ "$BOOT_STATUS" != "1" ]; then
+              echo "ERROR: Emulator has not completed boot"
+              exit 1
+            fi
+
+            echo "Emulator boot verified"
+            echo "Starting instrumentation tests"
+
             gradle --no-daemon --stacktrace :app:connectedDebugAndroidTest
 
       - name: Upload APK and test reports

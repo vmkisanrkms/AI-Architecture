@@ -25,7 +25,6 @@ jobs:
       BUNDLE_DIR: ${{ github.workspace }}/.ci-ai-architecture-bundle
 
     steps:
-
       - name: Checkout repository
         id: checkout
         uses: actions/checkout@v4
@@ -37,7 +36,6 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      # Android SDK: retain the working direct sdkmanager setup.
       - name: Install Android SDK without deprecated tools
         id: sdk
         shell: bash
@@ -51,8 +49,7 @@ jobs:
             exit 1
           fi
 
-          SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" \
-            -type f -name sdkmanager -perm -u+x -print -quit)"
+          SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager -perm -u+x -print -quit)"
 
           if [[ -z "$SDKMANAGER" ]]; then
             echo "::error::sdkmanager executable not found"
@@ -63,6 +60,7 @@ jobs:
           echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
           echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
           echo "$ANDROID_HOME/emulator" >> "$GITHUB_PATH"
+          echo "$ANDROID_HOME/build-tools/36.0.0" >> "$GITHUB_PATH"
 
           echo "Using sdkmanager: $SDKMANAGER"
 
@@ -94,17 +92,16 @@ jobs:
           "$ANDROID_HOME/platform-tools/adb" version
           echo "ANDROID_SDK_INSTALL=PASS"
 
-      # Extract the uploaded full source and CI bundle.
       - name: Extract and validate CI bundle
         id: source
         shell: bash
         run: |
           set -Eeuo pipefail
 
-          ZIP_FILE="$GITHUB_WORKSPACE/AI_Architecture_CI_CORRECTED_COMPLETE_V2.zip"
+          ZIP_FILE="$GITHUB_WORKSPACE/AI_Architecture_CI_CORRECTED_COMPLETE_V3.zip"
 
           if [[ ! -s "$ZIP_FILE" ]]; then
-            echo "::error::CI bundle ZIP missing"
+            echo "::error::CI bundle ZIP missing: $ZIP_FILE"
             ls -lah "$GITHUB_WORKSPACE"
             exit 1
           fi
@@ -153,7 +150,6 @@ jobs:
         with:
           gradle-version: '8.11.1'
 
-      # The project verifier reads this workflow from inside AI_Architecture.
       - name: Prepare workflow for static verification
         id: workflow_prepare
         shell: bash
@@ -174,7 +170,6 @@ jobs:
           test -s "$WORKFLOW_DEST"
           echo "Workflow prepared for project verifier"
 
-      # Static checks: preserve all existing project verifiers.
       - name: Verify source and run static verifiers
         id: static
         shell: bash
@@ -212,7 +207,7 @@ jobs:
 
           echo "Instrumentation configuration PASS"
 
-      # 1. Debug APK build.
+      # 1. Debug APK Build
       - name: Assemble Debug and Android Test APKs
         id: assemble
         shell: bash
@@ -233,7 +228,7 @@ jobs:
             app/build/outputs/apk/debug/app-debug.apk \
             app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
 
-      # 2. JVM Unit Tests.
+      # 2. JVM Unit Tests
       - name: Run JVM Unit Tests
         id: unit
         shell: bash
@@ -245,7 +240,7 @@ jobs:
           gradle --no-daemon --stacktrace \
             :app:testDebugUnitTest
 
-      # 3. Android Lint.
+      # 3. Android Lint
       - name: Run Android Lint
         id: lint
         shell: bash
@@ -257,9 +252,7 @@ jobs:
           gradle --no-daemon --stacktrace \
             :app:lintDebug
 
-      # 4. Emulator instrumentation.
-      # Required static-verifier task marker:
-      # :app:connectedDebugAndroidTest
+      # 4. Emulator Instrumentation Tests
       - name: Boot API 35 Emulator and run instrumentation tests
         id: emulator
         if: steps.assemble.outcome == 'success'
@@ -268,19 +261,18 @@ jobs:
         env:
           PROJECT_ROOT: ${{ env.PROJECT_ROOT }}
           STATUS_DIR: ${{ env.STATUS_DIR }}
-          EMULATOR_SCRIPT: ${{ env.EMULATOR_SCRIPT }}
           ANDROID_HOME: ${{ env.ANDROID_HOME }}
+          EMULATOR_SCRIPT: ${{ env.EMULATOR_SCRIPT }}
         with:
           api-level: 35
           target: google_apis
           arch: x86_64
           profile: pixel_2
           disable-animations: true
-          emulator-options: -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect
+          emulator-options: -no-window -no-audio -no-boot-anim -no-snapshot -wipe-data -gpu swiftshader_indirect
           emulator-boot-timeout: 900
           script: bash "$EMULATOR_SCRIPT"
 
-      # Report verification only runs when APK assembly succeeded.
       - name: Verify APKs and test reports
         id: reports
         if: always() && steps.assemble.outcome == 'success'

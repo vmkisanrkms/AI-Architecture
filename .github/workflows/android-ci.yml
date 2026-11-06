@@ -65,22 +65,23 @@ jobs:
           set -euo pipefail
 
           ZIP_FILE="AI_Architecture_Phase2_UNIT_TEST_FIX_V1_NOT_FINAL.zip"
+          SOURCE_DIR="$RUNNER_TEMP/ai-architecture-source"
+          PROJECT_ROOT="$SOURCE_DIR/AI_Architecture"
 
-          mkdir -p "$RUNNER_TEMP/ai-architecture-source"
+          rm -rf "$SOURCE_DIR"
+          mkdir -p "$SOURCE_DIR"
 
-          unzip -q "$ZIP_FILE" \
-            -d "$RUNNER_TEMP/ai-architecture-source"
-
-          PROJECT_ROOT="$RUNNER_TEMP/ai-architecture-source/AI_Architecture"
+          unzip -q "$ZIP_FILE" -d "$SOURCE_DIR"
 
           if [ ! -d "$PROJECT_ROOT" ]; then
             echo "::error::AI_Architecture project directory not found"
-            find "$RUNNER_TEMP/ai-architecture-source" -maxdepth 3 -type f
+            find "$SOURCE_DIR" -maxdepth 4 -type f
             exit 1
           fi
 
           if [ ! -f "$PROJECT_ROOT/settings.gradle.kts" ]; then
             echo "::error::settings.gradle.kts missing"
+            find "$SOURCE_DIR" -maxdepth 4 -name "settings.gradle*"
             exit 1
           fi
 
@@ -125,22 +126,22 @@ jobs:
       - name: Android debug build
         run: |
           set -euo pipefail
-          cd "$PROJECT_ROOT"
 
+          cd "$PROJECT_ROOT"
           gradle --no-daemon --stacktrace :app:assembleDebug
 
       - name: Run unit tests
         run: |
           set -euo pipefail
-          cd "$PROJECT_ROOT"
 
+          cd "$PROJECT_ROOT"
           gradle --no-daemon --stacktrace :app:testDebugUnitTest
 
       - name: Run Android lint
         run: |
           set -euo pipefail
-          cd "$PROJECT_ROOT"
 
+          cd "$PROJECT_ROOT"
           gradle --no-daemon --stacktrace :app:lintDebug
 
       - name: Run emulator instrumentation tests
@@ -151,7 +152,18 @@ jobs:
           profile: pixel_2
           disable-animations: true
           script: |
+            set -euo pipefail
+
+            PROJECT_ROOT="${{ runner.temp }}/ai-architecture-source/AI_Architecture"
+
+            echo "Checking Android project directory:"
+            echo "$PROJECT_ROOT"
+
             cd "$PROJECT_ROOT"
+
+            test -f settings.gradle.kts
+            test -f app/build.gradle.kts
+
             gradle --no-daemon --stacktrace :app:connectedDebugAndroidTest
 
       - name: Upload APK and test reports

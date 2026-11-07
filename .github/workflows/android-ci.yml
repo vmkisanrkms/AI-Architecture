@@ -41,6 +41,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+
           ANDROID_HOME="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
 
           if [[ ! -d "$ANDROID_HOME/cmdline-tools" ]]; then
@@ -57,11 +58,10 @@ jobs:
 
           echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
+
           echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
           echo "$ANDROID_HOME/emulator" >> "$GITHUB_PATH"
           echo "$ANDROID_HOME/build-tools/36.0.0" >> "$GITHUB_PATH"
-
-          echo "Using sdkmanager: $SDKMANAGER"
 
           set +e
           yes | "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --licenses
@@ -89,6 +89,7 @@ jobs:
           test -d "$ANDROID_HOME/system-images/android-35/google_apis/x86_64"
 
           "$ANDROID_HOME/platform-tools/adb" version
+
           echo "ANDROID_SDK_INSTALL=PASS"
 
       - name: Extract and validate CI bundle
@@ -167,6 +168,7 @@ jobs:
           cp "$WORKFLOW_SOURCE" "$WORKFLOW_DEST"
 
           test -s "$WORKFLOW_DEST"
+
           echo "Workflow prepared for project verifier"
 
       - name: Verify source and run static verifiers
@@ -206,9 +208,6 @@ jobs:
 
           echo "Instrumentation configuration PASS"
 
-      # Build Debug APK and Android Test APK.
-      # Required static verifier task:
-      # :app:connectedDebugAndroidTest
       - name: Assemble Debug and Android Test APKs
         id: assemble
         shell: bash
@@ -229,6 +228,8 @@ jobs:
             app/build/outputs/apk/debug/app-debug.apk \
             app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
 
+          echo "APK_ASSEMBLY=PASS"
+
       - name: Run JVM Unit Tests
         id: unit
         shell: bash
@@ -239,6 +240,8 @@ jobs:
 
           gradle --no-daemon --stacktrace \
             :app:testDebugUnitTest
+
+          echo "JVM_UNIT_TESTS=PASS"
 
       - name: Run Android Lint
         id: lint
@@ -251,7 +254,9 @@ jobs:
           gradle --no-daemon --stacktrace \
             :app:lintDebug
 
-      # Direct AVD startup. No android-emulator-runner action.
+          echo "ANDROID_LINT=PASS"
+
+      # Required task: :app:connectedDebugAndroidTest
       - name: Boot API 35 Emulator and run instrumentation tests
         id: emulator
         if: steps.assemble.outcome == 'success'
@@ -275,20 +280,58 @@ jobs:
           AVD_NAME="ai_architecture_api35"
           SERIAL="emulator-5554"
 
-          mkdir -p "$STATUS_DIR"
+          # Fixed AVD home directory
+          export ANDROID_USER_HOME="$HOME/.android"
+          export ANDROID_AVD_HOME="$ANDROID_USER_HOME/avd"
+
+          mkdir -p "$ANDROID_AVD_HOME" "$STATUS_DIR"
+
+          echo "ANDROID_USER_HOME=$ANDROID_USER_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_AVD_HOME=$ANDROID_AVD_HOME" >> "$GITHUB_ENV"
 
           if [[ -z "$AVDMANAGER" || ! -x "$EMULATOR" || ! -x "$ADB" ]]; then
             echo "::error::Android emulator tools are missing"
             exit 1
           fi
 
-          echo "no" | "$AVDMANAGER" create avd \
+          echo "Cleaning old AVD"
+
+          rm -rf "$ANDROID_AVD_HOME/$AVD_NAME.avd"
+          rm -f "$ANDROID_AVD_HOME/$AVD_NAME.ini"
+
+          echo "Creating Android API 35 AVD"
+
+          printf 'no\n' | "$AVDMANAGER" create avd \
             --force \
             --name "$AVD_NAME" \
             --package "$SYSTEM_IMAGE" \
-            --device "pixel_2"
+            --device "pixel_2" \
+            --path "$ANDROID_AVD_HOME/$AVD_NAME.avd"
+
+          echo "Checking AVD configuration"
+
+          if [[ ! -s "$ANDROID_AVD_HOME/$AVD_NAME.ini" ]]; then
+            echo "::error::AVD INI file missing"
+            find "$ANDROID_AVD_HOME" -maxdepth 2 -type f -print
+            exit 1
+          fi
+
+          if [[ ! -d "$ANDROID_AVD_HOME/$AVD_NAME.avd" ]]; then
+            echo "::error::AVD directory missing"
+            exit 1
+          fi
+
+          echo "Available Android Virtual Devices:"
+          "$EMULATOR" -list-avds
+
+          if ! "$EMULATOR" -list-avds | grep -Fxq "$AVD_NAME"; then
+            echo "::error::Created AVD is not visible to emulator"
+            exit 1
+          fi
 
           "$ADB" start-server
+
+          echo "Starting Android emulator"
 
           nohup "$EMULATOR" \
             -avd "$AVD_NAME" \
@@ -303,12 +346,14 @@ jobs:
             > "$STATUS_DIR/emulator-console.log" 2>&1 &
 
           EMULATOR_PID=$!
+
           echo "$EMULATOR_PID" > "$STATUS_DIR/emulator.pid"
 
           cleanup_on_failure() {
             rc=$?
+
             if [[ "$rc" -ne 0 ]]; then
-              echo "::error::Manual emulator boot or instrumentation step failed"
+              echo "::error::Emulator boot or instrumentation failed"
 
               "$ADB" devices -l \
                 > "$STATUS_DIR/adb-devices-on-failure.txt" 2>&1 || true
@@ -318,22 +363,24 @@ jobs:
               "$ADB" -s "$SERIAL" logcat -d -b all -v threadtime \
                 > "$STATUS_DIR/boot-failure-logcat.txt" 2>&1 || true
             fi
+
             exit "$rc"
           }
 
           trap cleanup_on_failure EXIT
 
-          # Wait for ADB transport to become online.
+          echo "Waiting for ADB online"
+
           ONLINE=0
 
           for attempt in $(seq 1 180); do
             if ! kill -0 "$EMULATOR_PID" 2>/dev/null; then
-              echo "::error::Emulator process exited during startup"
+              echo "::error::Emulator exited during startup"
               exit 1
             fi
 
-            STATE="$("$ADB" devices | awk \
-              -v serial="$SERIAL" '$1 == serial {print $2; exit}')"
+            STATE="$("$ADB" devices | awk -v serial="$SERIAL" \
+              '$1 == serial {print $2; exit}')"
 
             if [[ "$STATE" == "device" ]]; then
               ONLINE=1
@@ -348,16 +395,17 @@ jobs:
           done
 
           if [[ "$ONLINE" -ne 1 ]]; then
-            echo "::error::Emulator did not become ADB-online within 15 minutes"
+            echo "::error::Emulator did not become ADB-online"
             exit 1
           fi
 
-          # Wait for Android framework boot completion.
+          echo "Waiting for Android boot"
+
           BOOTED=0
 
           for attempt in $(seq 1 180); do
-            VALUE="$("$ADB" -s "$SERIAL" shell \
-              getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)"
+            VALUE="$("$ADB" -s "$SERIAL" shell getprop sys.boot_completed \
+              2>/dev/null | tr -d '\r' || true)"
 
             if [[ "$VALUE" == "1" ]]; then
               BOOTED=1
@@ -368,24 +416,25 @@ jobs:
           done
 
           if [[ "$BOOTED" -ne 1 ]]; then
-            echo "::error::Android framework did not finish booting"
+            echo "::error::Android framework boot timed out"
             exit 1
           fi
 
-          API_LEVEL="$("$ADB" -s "$SERIAL" shell \
-            getprop ro.build.version.sdk | tr -d '\r')"
+          API_LEVEL="$("$ADB" -s "$SERIAL" shell getprop ro.build.version.sdk \
+            | tr -d '\r')"
 
           if [[ "$API_LEVEL" != "35" ]]; then
             echo "::error::Expected Android API 35, got $API_LEVEL"
             exit 1
           fi
 
-          # Wait for Package Manager.
+          echo "Waiting for Android Package Manager"
+
           PM_READY=0
 
           for attempt in $(seq 1 60); do
             if "$ADB" -s "$SERIAL" shell pm path android \
-                >/dev/null 2>&1; then
+              >/dev/null 2>&1; then
               PM_READY=1
               break
             fi
@@ -394,13 +443,17 @@ jobs:
           done
 
           if [[ "$PM_READY" -ne 1 ]]; then
-            echo "::error::Package Manager did not become ready"
+            echo "::error::Android Package Manager not ready"
             exit 1
           fi
 
           echo "EMULATOR_BOOT=PASS API=$API_LEVEL SERIAL=$SERIAL"
 
+          echo "Starting Android instrumentation tests"
+
           bash "$EMULATOR_SCRIPT"
+
+          echo "INSTRUMENTATION_STEP=PASS"
 
       - name: Verify APKs and test reports
         id: reports
@@ -435,6 +488,7 @@ jobs:
           set -u
 
           mkdir -p "$STATUS_DIR"
+
           RESULT=0
 
           {
@@ -455,22 +509,32 @@ jobs:
           } | tee "$STATUS_DIR/final-ci-summary.txt"
 
           for VALUE in \
-            "$CHECKOUT" "$JAVA" "$SDK" "$SOURCE" "$GRADLE" \
-            "$WORKFLOW_PREPARE" "$STATIC" "$TEST_CONFIG" \
-            "$ASSEMBLE" "$UNIT" "$LINT" "$EMULATOR"
+            "$CHECKOUT" \
+            "$JAVA" \
+            "$SDK" \
+            "$SOURCE" \
+            "$GRADLE" \
+            "$WORKFLOW_PREPARE" \
+            "$STATIC" \
+            "$TEST_CONFIG" \
+            "$ASSEMBLE" \
+            "$UNIT" \
+            "$LINT" \
+            "$EMULATOR" \
+            "$REPORTS"
           do
-            [[ "$VALUE" == "success" ]] || RESULT=1
+            if [[ "$VALUE" != "success" ]]; then
+              RESULT=1
+            fi
           done
 
-          if [[ "$ASSEMBLE" == "success" && "$REPORTS" != "success" ]]; then
-            RESULT=1
-          fi
-
           if [[ "$RESULT" -eq 0 ]]; then
-            echo "FINAL_RESULT=PASS" | tee -a "$STATUS_DIR/final-ci-summary.txt"
+            echo "FINAL_RESULT=PASS" \
+              | tee -a "$STATUS_DIR/final-ci-summary.txt"
           else
             echo "::error::FINAL_RESULT=FAIL"
-            echo "FINAL_RESULT=FAIL" | tee -a "$STATUS_DIR/final-ci-summary.txt"
+            echo "FINAL_RESULT=FAIL" \
+              | tee -a "$STATUS_DIR/final-ci-summary.txt"
           fi
 
           exit "$RESULT"

@@ -28,8 +28,6 @@ jobs:
       - name: Checkout repository
         id: checkout
         uses: actions/checkout@v4
-        with:
-          persist-credentials: false
 
       - name: Set up JDK 17
         id: java
@@ -282,7 +280,6 @@ jobs:
           AVD_NAME="ai_architecture_api35"
           SERIAL="emulator-5554"
 
-          # Use one fixed Android AVD location for creation and startup.
           export ANDROID_USER_HOME="$HOME/.android"
           export ANDROID_AVD_HOME="$ANDROID_USER_HOME/avd"
 
@@ -296,9 +293,44 @@ jobs:
             exit 1
           fi
 
-          echo "AVD HOME: $ANDROID_AVD_HOME"
+          echo "Checking KVM device"
 
-          # Remove only the old AVD with this name.
+          if [[ ! -e /dev/kvm ]]; then
+            echo "::error::This GitHub runner does not provide /dev/kvm"
+            exit 1
+          fi
+
+          echo "KVM device details:"
+          ls -l /dev/kvm
+          getent group kvm || true
+
+          # First try direct device permission repair.
+          sudo chmod 666 /dev/kvm || true
+
+          KVM_LAUNCH_MODE="direct"
+
+          if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
+            echo "Direct KVM access unavailable; adding runner to kvm group"
+
+            if ! getent group kvm >/dev/null; then
+              echo "::error::KVM group does not exist on this runner"
+              exit 1
+            fi
+
+            sudo usermod -aG kvm "$USER"
+
+            if ! command -v sg >/dev/null 2>&1; then
+              echo "::error::sg command is unavailable"
+              exit 1
+            fi
+
+            KVM_LAUNCH_MODE="group"
+          fi
+
+          echo "KVM launch mode: $KVM_LAUNCH_MODE"
+
+          echo "Removing old AVD"
+
           rm -rf "$ANDROID_AVD_HOME/$AVD_NAME.avd"
           rm -f "$ANDROID_AVD_HOME/$AVD_NAME.ini"
 
@@ -310,49 +342,73 @@ jobs:
             --package "$SYSTEM_IMAGE" \
             --device "pixel_2"
 
-          # Verify that avdmanager registered the AVD in the expected home.
           if [[ ! -s "$ANDROID_AVD_HOME/$AVD_NAME.ini" ]]; then
-            echo "::error::AVD INI file was not created in $ANDROID_AVD_HOME"
+            echo "::error::AVD INI file missing"
             find "$ANDROID_USER_HOME" -maxdepth 4 -type f -print || true
             exit 1
           fi
 
           if [[ ! -d "$ANDROID_AVD_HOME/$AVD_NAME.avd" ]]; then
-            echo "::error::AVD data directory was not created"
+            echo "::error::AVD data directory missing"
             exit 1
           fi
 
-          echo "Checking registered AVD list"
+          echo "Checking registered AVD"
 
           "$EMULATOR" -list-avds | tee "$STATUS_DIR/available-avds.txt"
 
           if ! grep -Fxq "$AVD_NAME" "$STATUS_DIR/available-avds.txt"; then
-            echo "::error::AVD is not visible to Android Emulator"
+            echo "::error::AVD is not registered"
             exit 1
           fi
 
-          # Confirm that emulator and avdmanager use the same AVD home.
-          echo "Checking AVD configuration"
+          echo "AVD configuration:"
           cat "$ANDROID_AVD_HOME/$AVD_NAME.ini"
 
           "$ADB" start-server
 
-          echo "Starting Android emulator"
+          echo "Starting Android emulator with KVM"
 
-          nohup "$EMULATOR" \
-            -avd "$AVD_NAME" \
-            -port 5554 \
-            -no-window \
-            -no-audio \
-            -no-boot-anim \
-            -no-snapshot \
-            -wipe-data \
-            -gpu swiftshader_indirect \
-            -no-metrics \
-            > "$STATUS_DIR/emulator-console.log" 2>&1 &
+          EMULATOR_LOG="$STATUS_DIR/emulator-console.log"
+          EMULATOR_PID_FILE="$STATUS_DIR/emulator.pid"
 
-          EMULATOR_PID=$!
-          echo "$EMULATOR_PID" > "$STATUS_DIR/emulator.pid"
+          if [[ "$KVM_LAUNCH_MODE" == "group" ]]; then
+            # Launch with kvm as the effective group.
+            sg kvm -c "nohup '$EMULATOR' \
+              -avd '$AVD_NAME' \
+              -port 5554 \
+              -accel on \
+              -no-window \
+              -no-audio \
+              -no-boot-anim \
+              -no-snapshot \
+              -wipe-data \
+              -gpu swiftshader_indirect \
+              -no-metrics \
+              > '$EMULATOR_LOG' 2>&1 & echo \$! > '$EMULATOR_PID_FILE'"
+          else
+            nohup "$EMULATOR" \
+              -avd "$AVD_NAME" \
+              -port 5554 \
+              -accel on \
+              -no-window \
+              -no-audio \
+              -no-boot-anim \
+              -no-snapshot \
+              -wipe-data \
+              -gpu swiftshader_indirect \
+              -no-metrics \
+              > "$EMULATOR_LOG" 2>&1 &
+
+            echo "$!" > "$EMULATOR_PID_FILE"
+          fi
+
+          if [[ ! -s "$EMULATOR_PID_FILE" ]]; then
+            echo "::error::Emulator PID was not recorded"
+            exit 1
+          fi
+
+          EMULATOR_PID="$(cat "$EMULATOR_PID_FILE")"
 
           cleanup_on_failure() {
             rc=$?
@@ -363,7 +419,7 @@ jobs:
               "$ADB" devices -l \
                 > "$STATUS_DIR/adb-devices-on-failure.txt" 2>&1 || true
 
-              tail -n 250 "$STATUS_DIR/emulator-console.log" || true
+              tail -n 250 "$EMULATOR_LOG" || true
 
               "$ADB" -s "$SERIAL" logcat -d -b all -v threadtime \
                 > "$STATUS_DIR/boot-failure-logcat.txt" 2>&1 || true
@@ -380,7 +436,7 @@ jobs:
 
           for attempt in $(seq 1 180); do
             if ! kill -0 "$EMULATOR_PID" 2>/dev/null; then
-              echo "::error::Emulator exited during startup"
+              echo "::error::Emulator process exited"
               exit 1
             fi
 

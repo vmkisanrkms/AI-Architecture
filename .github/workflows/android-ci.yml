@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   android:
-    name: AI Architecture Android Build, Tests and Debug APK
+    name: Android Build, PSI, Room, Tests, Emulator and APK
     runs-on: ubuntu-latest
     timeout-minutes: 150
 
@@ -25,82 +25,98 @@ jobs:
       BUILD_TOOLS_VERSION: '36.0.0'
       GRADLE_VERSION: '8.11.1'
       KOTLIN_COMPILER_VERSION: '1.9.0'
-      LOG_DIR: ${{ github.workspace }}/.ci-logs
       SOURCE_ZIP_NAME: AI_Architecture_GITHUB_ACTIONS_BUILD_FIXED_V8.zip
+      LOG_DIR: ${{ github.workspace }}/.ci-logs
 
     steps:
 
-      # 1. Checkout repository
+      # 1. Checkout
       - name: Checkout source
         id: checkout
         uses: actions/checkout@v4
 
-      # 2. Extract Android project ZIP and locate project root
-      - name: Extract ZIP and locate Android project root
+      # 2. Extract and locate Android project
+      - name: Extract source ZIP and locate Android project
         id: project
         shell: bash
         run: |
           set -Eeuo pipefail
 
+          EXTRACT_DIR="$RUNNER_TEMP/ai-architecture-source"
+
           mkdir -p "$LOG_DIR"
 
           SOURCE_ZIP="$GITHUB_WORKSPACE/$SOURCE_ZIP_NAME"
-          EXTRACT_DIR="$RUNNER_TEMP/ai-architecture-source"
-
-          echo "Checking source ZIP..."
 
           if [[ ! -s "$SOURCE_ZIP" ]]; then
-            echo "ERROR: Source ZIP missing:"
-            echo "$SOURCE_ZIP"
-            echo "Repository files:"
-            find "$GITHUB_WORKSPACE" -maxdepth 3 -type f | head -100
+            echo "ERROR: Source ZIP not found: $SOURCE_ZIP"
+
+            find "$GITHUB_WORKSPACE" \
+              -maxdepth 5 -type f \
+              | tee "$LOG_DIR/repository-files.txt"
+
             exit 1
           fi
 
           echo "Checking ZIP integrity..."
+
           unzip -t "$SOURCE_ZIP" \
-            | tee "$LOG_DIR/zip-integrity.log"
+            2>&1 | tee "$LOG_DIR/zip-integrity.log"
 
+          rm -rf "$EXTRACT_DIR"
           mkdir -p "$EXTRACT_DIR"
-          unzip -q -o "$SOURCE_ZIP" -d "$EXTRACT_DIR"
 
-          echo "ZIP extraction completed."
+          echo "Extracting Android project..."
 
-          SETTINGS_FILE="$(
+          unzip -q "$SOURCE_ZIP" -d "$EXTRACT_DIR"
+
+          echo "ZIP_EXTRACTION=PASS"
+
+          PROJECT_ROOT=""
+
+          while IFS= read -r SETTINGS_FILE; do
+
+            CANDIDATE_ROOT="$(dirname "$SETTINGS_FILE")"
+
+            if [[ -f "$CANDIDATE_ROOT/app/build.gradle.kts" ]]; then
+              PROJECT_ROOT="$CANDIDATE_ROOT"
+              break
+            fi
+
+          done < <(
             find "$EXTRACT_DIR" \
-              -maxdepth 8 \
+              -maxdepth 12 \
+              -type f \
               -name settings.gradle.kts \
               -not -path '*/.gradle/*' \
-              -print -quit
-          )"
+              -print
+          )
 
-          if [[ -z "$SETTINGS_FILE" ]]; then
-            echo "ERROR: settings.gradle.kts not found."
-            find "$EXTRACT_DIR" -maxdepth 5 -type f \
+          if [[ -z "$PROJECT_ROOT" ]]; then
+            echo "ERROR: Valid Android project root not found."
+
+            find "$EXTRACT_DIR" \
+              -maxdepth 10 -type f \
               | tee "$LOG_DIR/extracted-files.txt"
+
             exit 1
           fi
 
-          PROJECT_ROOT="$(dirname "$SETTINGS_FILE")"
-
-          if [[ ! -f "$PROJECT_ROOT/app/build.gradle.kts" ]]; then
-            echo "ERROR: app/build.gradle.kts missing."
-            exit 1
-          fi
+          test -f "$PROJECT_ROOT/settings.gradle.kts"
+          test -f "$PROJECT_ROOT/app/build.gradle.kts"
 
           echo "PROJECT_ROOT=$PROJECT_ROOT" >> "$GITHUB_ENV"
           echo "project_root=$PROJECT_ROOT" >> "$GITHUB_OUTPUT"
 
-          echo "ANDROID_PROJECT_ROOT=$PROJECT_ROOT"
-          echo "ZIP_EXTRACTION=PASS"
-
           {
             echo "PROJECT_ROOT=$PROJECT_ROOT"
-            echo "SETTINGS_FILE=$SETTINGS_FILE"
+            echo "SETTINGS_FILE=$PROJECT_ROOT/settings.gradle.kts"
+            echo "APP_BUILD_FILE=$PROJECT_ROOT/app/build.gradle.kts"
+            echo "ZIP_EXTRACTION=PASS"
           } | tee "$LOG_DIR/project-location.txt"
 
-          find "$PROJECT_ROOT" -maxdepth 2 -type f \
-            | head -100 \
+          find "$PROJECT_ROOT" \
+            -maxdepth 3 -type f \
             | tee "$LOG_DIR/project-files.txt"
 
       # 3. JDK 17
@@ -119,12 +135,54 @@ jobs:
           gradle-version: '8.11.1'
           cache-disabled: false
 
-      # 5. Android SDK
-      - name: Set up Android SDK
+      # 5. Locate existing Android SDK
+      - name: Locate Android SDK command-line tools
         id: android_sdk
-        uses: android-actions/setup-android@v3
+        shell: bash
+        run: |
+          set -Eeuo pipefail
 
-      # 6. Android API 36 packages
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+
+          if [[ ! -d "$SDK_ROOT" ]]; then
+            echo "ERROR: Android SDK not found: $SDK_ROOT"
+            exit 1
+          fi
+
+          if [[ ! -d "$SDK_ROOT/cmdline-tools" ]]; then
+            echo "ERROR: Android command-line tools directory missing"
+            exit 1
+          fi
+
+          SDKMANAGER="$(
+            find "$SDK_ROOT/cmdline-tools" \
+              -type f \
+              -name sdkmanager \
+              -print 2>/dev/null \
+              | sort -V \
+              | tail -n 1
+          )"
+
+          if [[ -z "$SDKMANAGER" || ! -x "$SDKMANAGER" ]]; then
+            echo "ERROR: Executable sdkmanager not found"
+            find "$SDK_ROOT" -maxdepth 6 -type f -name sdkmanager
+            exit 1
+          fi
+
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "SDKMANAGER=$SDKMANAGER" >> "$GITHUB_ENV"
+
+          echo "$SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
+          echo "$(dirname "$SDKMANAGER")" >> "$GITHUB_PATH"
+
+          {
+            echo "SDK_ROOT=$SDK_ROOT"
+            echo "SDKMANAGER=$SDKMANAGER"
+            "$SDKMANAGER" --version
+          } 2>&1 | tee "$LOG_DIR/android-sdk-tools.log"
+
+      # 6. Install Android SDK packages
       - name: Install Android API 36 and Build Tools
         id: sdk_packages
         shell: bash
@@ -133,10 +191,14 @@ jobs:
 
           mkdir -p "$LOG_DIR"
 
-          sdkmanager --licenses < <(yes) \
+          echo "Accepting SDK licenses..."
+
+          "$SDKMANAGER" --licenses < <(yes) \
             2>&1 | tee "$LOG_DIR/android-sdk-licenses.log"
 
-          sdkmanager \
+          echo "Installing Android packages..."
+
+          "$SDKMANAGER" \
             'platform-tools' \
             'platforms;android-36' \
             'build-tools;36.0.0' \
@@ -147,20 +209,23 @@ jobs:
           test -x "$ANDROID_HOME/platform-tools/adb"
           test -d "$ANDROID_HOME/platforms/android-36"
           test -d "$ANDROID_HOME/build-tools/36.0.0"
+          test -x "$ANDROID_HOME/emulator/emulator"
+          test -d "$ANDROID_HOME/system-images/android-36/google_apis/x86_64"
 
           echo "ANDROID_SDK_INSTALL=PASS"
 
-      # 7. Kotlin compiler for PSI verification
+      # 7. Kotlin compiler 1.9.0 for PSI guard
       - name: Install Kotlin compiler 1.9.0
         id: kotlin_compiler
         shell: bash
         run: |
           set -Eeuo pipefail
 
-          mkdir -p "$LOG_DIR"
-
           KOTLIN_DIR="$RUNNER_TEMP/kotlin-compiler-$KOTLIN_COMPILER_VERSION"
           ARCHIVE="$RUNNER_TEMP/kotlin-compiler-$KOTLIN_COMPILER_VERSION.zip"
+
+          rm -rf "$KOTLIN_DIR"
+          mkdir -p "$KOTLIN_DIR"
 
           curl --fail --location --retry 3 \
             "https://github.com/JetBrains/kotlin/releases/download/v${KOTLIN_COMPILER_VERSION}/kotlin-compiler-${KOTLIN_COMPILER_VERSION}.zip" \
@@ -200,23 +265,26 @@ jobs:
             kotlinc -version
 
             echo "=== ANDROID SDK ==="
-            echo "$ANDROID_HOME"
+            echo "ANDROID_HOME=$ANDROID_HOME"
+            echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
+
+            echo "=== SDK PACKAGES ==="
+            "$SDKMANAGER" --list_installed
 
             echo "=== ADB ==="
             adb version
-
-            echo "=== SDK PACKAGES ==="
-            sdkmanager --list_installed
           } 2>&1 | tee "$LOG_DIR/environment.txt"
 
           java -version 2>&1 | grep -F '17.'
           gradle --version | grep -F 'Gradle 8.11.1'
           kotlinc -version 2>&1 | grep -F '1.9.0'
 
+          test -s "$KOTLIN_HOME/lib/kotlin-compiler.jar"
+          test -x "$ANDROID_HOME/platform-tools/adb"
           test -d "$ANDROID_HOME/platforms/android-36"
           test -d "$ANDROID_HOME/build-tools/36.0.0"
 
-      # 9. Resolve project dependencies
+      # 9. Resolve Gradle dependencies
       - name: Resolve Gradle dependencies
         id: dependencies
         working-directory: ${{ steps.project.outputs.project_root }}
@@ -229,24 +297,37 @@ jobs:
             2>&1 | tee "$LOG_DIR/dependencies.log"
 
       # 10. PSI and Tokenizer fixtures
-      - name: Run V7 PSI and Tokenizer fixtures
+      - name: Run PSI and Tokenizer fixtures
         id: reflection_fixtures
         working-directory: ${{ steps.project.outputs.project_root }}
         shell: bash
         run: |
           set -Eeuo pipefail
 
-          if [[ ! -f scripts/test_dao_reflection_guard.py ]]; then
-            echo "ERROR: DAO reflection guard script missing."
-            exit 1
-          fi
+          test -f scripts/dao_access_guard.py
+          test -f scripts/test_dao_reflection_guard.py
 
           python3 scripts/test_dao_reflection_guard.py \
             2>&1 | tee "$LOG_DIR/dao-reflection-fixtures.log"
 
+          grep -F 'PSI_COMPILER=1.9.0' \
+            "$LOG_DIR/dao-reflection-fixtures.log"
+
+          grep -F 'PSI_RUNTIME=AVAILABLE' \
+            "$LOG_DIR/dao-reflection-fixtures.log"
+
+          grep -F 'PSI_COMPILATION=SUCCESS' \
+            "$LOG_DIR/dao-reflection-fixtures.log"
+
+          grep -F 'PSI_FIXTURES=EXECUTED' \
+            "$LOG_DIR/dao-reflection-fixtures.log"
+
+          grep -F 'RESULT=TOKENIZER_AND_PSI_FIXTURES_PASS' \
+            "$LOG_DIR/dao-reflection-fixtures.log"
+
           echo "REFLECTION_FIXTURES=PASS"
 
-      # 11. Static verification
+      # 11. Static project verification
       - name: Run static project verifiers
         id: static_verifiers
         working-directory: ${{ steps.project.outputs.project_root }}
@@ -268,11 +349,10 @@ jobs:
 
             LOG_FILE="$LOG_DIR/$(basename "${script%.py}").log"
 
-            echo "===================================="
             echo "RUNNING: $script"
-            echo "===================================="
 
-            python3 "$script" 2>&1 | tee "$LOG_FILE"
+            python3 "$script" \
+              2>&1 | tee "$LOG_FILE"
           done
 
           echo "STATIC_VERIFIERS=PASS"
@@ -296,9 +376,15 @@ jobs:
             cp -a app/schemas/. "$LOG_DIR/room-schemas/"
           fi
 
-          find app/schemas -type f -name '*.json' -print \
-            2>/dev/null \
-            | tee "$LOG_DIR/room-schema-files.txt" || true
+          if [[ -d app/schemas ]]; then
+            find app/schemas \
+              -type f -name '*.json' \
+              -print \
+              | tee "$LOG_DIR/room-schema-files.txt"
+          else
+            echo "Room schema directory not generated." \
+              | tee "$LOG_DIR/room-schema-files.txt"
+          fi
 
           echo "KOTLIN_COMPILE_AND_KAPT=PASS"
 
@@ -342,6 +428,8 @@ jobs:
 
             cd "$PROJECT_ROOT"
 
+            mkdir -p "$LOG_DIR"
+
             adb devices -l \
               | tee "$LOG_DIR/emulator-devices.txt"
 
@@ -367,13 +455,13 @@ jobs:
           APK="app/build/outputs/apk/debug/app-debug.apk"
 
           if [[ ! -s "$APK" ]]; then
-            echo "ERROR: Debug APK not generated."
+            echo "ERROR: Debug APK not generated"
             exit 1
           fi
 
           echo "DEBUG_APK_BUILD=PASS"
 
-      # 17. Verify APK
+      # 17. APK verification
       - name: Verify APK package, alignment and signature
         id: verify_apk
         working-directory: ${{ steps.project.outputs.project_root }}
@@ -388,6 +476,9 @@ jobs:
           APKSIGNER="$ANDROID_HOME/build-tools/36.0.0/apksigner"
 
           test -s "$APK"
+          test -x "$AAPT"
+          test -x "$ZIPALIGN"
+          test -x "$APKSIGNER"
 
           "$AAPT" dump badging "$APK" \
             | tee "$LOG_DIR/apk-badging.txt"
@@ -409,7 +500,7 @@ jobs:
 
           echo "APK_VERIFICATION=PASS"
 
-      # 18. Final build summary
+      # 18. Final summary
       - name: Create final build summary
         id: final_summary
         if: always()
@@ -419,6 +510,7 @@ jobs:
           PROJECT: ${{ steps.project.outcome }}
           JAVA: ${{ steps.java.outcome }}
           GRADLE: ${{ steps.gradle.outcome }}
+          SDK_TOOLS: ${{ steps.android_sdk.outcome }}
           SDK: ${{ steps.sdk_packages.outcome }}
           KOTLIN: ${{ steps.kotlin_compiler.outcome }}
           ENVIRONMENT: ${{ steps.environment.outcome }}
@@ -445,28 +537,29 @@ jobs:
             echo "Package: com.aiarchitecture.app"
             echo ""
             echo "Checkout: $CHECKOUT"
-            echo "Project ZIP extraction: $PROJECT"
+            echo "ZIP Extraction / Project Root: $PROJECT"
             echo "JDK 17: $JAVA"
             echo "Gradle 8.11.1: $GRADLE"
-            echo "Android SDK API 36: $SDK"
-            echo "Kotlin compiler: $KOTLIN"
+            echo "Android SDK Tools: $SDK_TOOLS"
+            echo "Android API 36: $SDK"
+            echo "Kotlin Compiler: $KOTLIN"
             echo "Environment: $ENVIRONMENT"
             echo "Dependencies: $DEPENDENCIES"
             echo "PSI and Tokenizer: $REFLECTION"
-            echo "Static verification: $STATIC"
+            echo "Static Verifiers: $STATIC"
             echo "Kotlin and Room KAPT: $COMPILE"
-            echo "JVM tests: $UNIT"
+            echo "JVM Tests: $UNIT"
             echo "Android Lint: $LINT"
-            echo "Emulator tests: $EMULATOR"
+            echo "Emulator Tests: $EMULATOR"
             echo "Debug APK: $APK"
-            echo "APK verification: $VERIFY"
+            echo "APK Verification: $VERIFY"
           } | tee "$LOG_DIR/FINAL_BUILD_SUMMARY.md"
 
           for status in \
-            "$CHECKOUT" "$PROJECT" "$JAVA" "$GRADLE" "$SDK" \
-            "$KOTLIN" "$ENVIRONMENT" "$DEPENDENCIES" "$REFLECTION" \
-            "$STATIC" "$COMPILE" "$UNIT" "$LINT" "$EMULATOR" \
-            "$APK" "$VERIFY"
+            "$CHECKOUT" "$PROJECT" "$JAVA" "$GRADLE" \
+            "$SDK_TOOLS" "$SDK" "$KOTLIN" "$ENVIRONMENT" \
+            "$DEPENDENCIES" "$REFLECTION" "$STATIC" "$COMPILE" \
+            "$UNIT" "$LINT" "$EMULATOR" "$APK" "$VERIFY"
           do
             [[ "$status" == "success" ]] || RESULT=1
           done
@@ -481,28 +574,64 @@ jobs:
 
           exit "$RESULT"
 
-      # 19. Upload APK
+      # 19. Prepare artifacts
+      - name: Prepare build artifacts
+        id: prepare_artifacts
+        if: always()
+        shell: bash
+        env:
+          PROJECT_ROOT: ${{ steps.project.outputs.project_root }}
+        run: |
+          set -u
+
+          ARTIFACT_DIR="$GITHUB_WORKSPACE/.ci-artifacts"
+
+          mkdir -p "$ARTIFACT_DIR/logs"
+
+          if [[ -n "$PROJECT_ROOT" && -s "$PROJECT_ROOT/app/build/outputs/apk/debug/app-debug.apk" ]]; then
+            mkdir -p "$ARTIFACT_DIR/apk"
+
+            cp "$PROJECT_ROOT/app/build/outputs/apk/debug/app-debug.apk" \
+              "$ARTIFACT_DIR/apk/AI-Architecture-debug.apk"
+          fi
+
+          if [[ -d "$LOG_DIR" ]]; then
+            cp -a "$LOG_DIR/." "$ARTIFACT_DIR/logs/" 2>/dev/null || true
+          fi
+
+          if [[ -n "$PROJECT_ROOT" && -d "$PROJECT_ROOT/app/build/reports" ]]; then
+            cp -a "$PROJECT_ROOT/app/build/reports" \
+              "$ARTIFACT_DIR/" 2>/dev/null || true
+          fi
+
+          if [[ -n "$PROJECT_ROOT" && -d "$PROJECT_ROOT/app/build/test-results" ]]; then
+            cp -a "$PROJECT_ROOT/app/build/test-results" \
+              "$ARTIFACT_DIR/" 2>/dev/null || true
+          fi
+
+          if [[ -n "$PROJECT_ROOT" && -d "$PROJECT_ROOT/app/schemas" ]]; then
+            cp -a "$PROJECT_ROOT/app/schemas" \
+              "$ARTIFACT_DIR/" 2>/dev/null || true
+          fi
+
+      # 20. Upload APK
       - name: Upload Debug APK
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: AI_Architecture_DEBUG_APK
-          path: ${{ steps.project.outputs.project_root }}/app/build/outputs/apk/debug/app-debug.apk
+          path: .ci-artifacts/apk/AI-Architecture-debug.apk
           if-no-files-found: warn
+          include-hidden-files: true
           retention-days: 30
 
-      # 20. Upload reports and logs
+      # 21. Upload logs and reports
       - name: Upload build logs and reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: AI_Architecture_BUILD_LOGS_AND_REPORTS
+          path: .ci-artifacts/**
           if-no-files-found: warn
           include-hidden-files: true
           retention-days: 30
-          path: |
-            .ci-logs/**
-            ${{ steps.project.outputs.project_root }}/app/build/reports/**
-            ${{ steps.project.outputs.project_root }}/app/build/test-results/**
-            ${{ steps.project.outputs.project_root }}/app/build/outputs/androidTest-results/**
-            ${{ steps.project.outputs.project_root }}/app/schemas/**

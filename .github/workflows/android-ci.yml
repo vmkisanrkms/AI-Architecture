@@ -1,4 +1,3 @@
-
 name: AI Architecture Android CI
 
 on:
@@ -98,7 +97,7 @@ jobs:
         run: |
           set -Eeuo pipefail
 
-          ZIP_FILE="$GITHUB_WORKSPACE/AI_Architecture_CI_CORRECTED_COMPLETE_V5.zip"
+          ZIP_FILE="$GITHUB_WORKSPACE/AI_Architecture_CI_TESTS_FIXED_V7.zip"
 
           if [[ ! -s "$ZIP_FILE" ]]; then
             echo "::error::CI bundle ZIP missing"
@@ -304,7 +303,6 @@ jobs:
           ls -l /dev/kvm
           getent group kvm || true
 
-          # First try direct device permission repair.
           sudo chmod 666 /dev/kvm || true
 
           KVM_LAUNCH_MODE="direct"
@@ -373,7 +371,6 @@ jobs:
           EMULATOR_PID_FILE="$STATUS_DIR/emulator.pid"
 
           if [[ "$KVM_LAUNCH_MODE" == "group" ]]; then
-            # Launch with kvm as the effective group.
             sg kvm -c "nohup '$EMULATOR' \
               -avd '$AVD_NAME' \
               -port 5554 \

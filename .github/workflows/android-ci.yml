@@ -1,3 +1,4 @@
+
 name: AI Architecture Android CI
 
 on:
@@ -85,6 +86,11 @@ jobs:
           test -d "$ANDROID_HOME/build-tools/36.0.0"
           test -d "$ANDROID_HOME/system-images/android-36/google_apis/x86_64"
 
+          # FIX: GITHUB_PATH applies to NEXT steps.
+          # Export PATH also for THIS current step.
+          export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$ANDROID_HOME/build-tools/36.0.0:$PATH"
+
+          command -v adb
           adb version
           java -version
 
@@ -445,3 +451,4 @@ jobs:
             .ci-ai-architecture-bundle/**/app/build/outputs/androidTest-results/**
           if-no-files-found: warn
           retention-days: 14
+          include-hidden-files: true

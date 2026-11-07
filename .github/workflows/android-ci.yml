@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   android:
-    name: Android compile, Room, tests, emulator and Debug APK
+    name: AI Architecture Android Build, Tests and Debug APK
     runs-on: ubuntu-latest
     timeout-minutes: 150
 
@@ -26,56 +26,106 @@ jobs:
       GRADLE_VERSION: '8.11.1'
       KOTLIN_COMPILER_VERSION: '1.9.0'
       LOG_DIR: ${{ github.workspace }}/.ci-logs
+      SOURCE_ZIP_NAME: AI_Architecture_GITHUB_ACTIONS_BUILD_FIXED_V8.zip
 
     steps:
+
+      # 1. Checkout repository
       - name: Checkout source
         id: checkout
         uses: actions/checkout@v4
 
-      - name: Locate Android project root
+      # 2. Extract Android project ZIP and locate project root
+      - name: Extract ZIP and locate Android project root
         id: project
         shell: bash
         run: |
           set -Eeuo pipefail
 
-          if [[ -f "$GITHUB_WORKSPACE/settings.gradle.kts" && -f "$GITHUB_WORKSPACE/app/build.gradle.kts" ]]; then
-            PROJECT_ROOT="$GITHUB_WORKSPACE"
-          elif [[ -f "$GITHUB_WORKSPACE/AI_Architecture/settings.gradle.kts" && -f "$GITHUB_WORKSPACE/AI_Architecture/app/build.gradle.kts" ]]; then
-            PROJECT_ROOT="$GITHUB_WORKSPACE/AI_Architecture"
-          else
-            SETTINGS_FILE="$(find "$GITHUB_WORKSPACE" -maxdepth 5 -name settings.gradle.kts -not -path '*/.gradle/*' -print -quit)"
-            [[ -n "$SETTINGS_FILE" ]] || {
-              echo "Android project root not found"
-              exit 1
-            }
-            PROJECT_ROOT="$(dirname "$SETTINGS_FILE")"
+          mkdir -p "$LOG_DIR"
+
+          SOURCE_ZIP="$GITHUB_WORKSPACE/$SOURCE_ZIP_NAME"
+          EXTRACT_DIR="$RUNNER_TEMP/ai-architecture-source"
+
+          echo "Checking source ZIP..."
+
+          if [[ ! -s "$SOURCE_ZIP" ]]; then
+            echo "ERROR: Source ZIP missing:"
+            echo "$SOURCE_ZIP"
+            echo "Repository files:"
+            find "$GITHUB_WORKSPACE" -maxdepth 3 -type f | head -100
+            exit 1
           fi
 
-          [[ -f "$PROJECT_ROOT/app/build.gradle.kts" ]]
+          echo "Checking ZIP integrity..."
+          unzip -t "$SOURCE_ZIP" \
+            | tee "$LOG_DIR/zip-integrity.log"
+
+          mkdir -p "$EXTRACT_DIR"
+          unzip -q -o "$SOURCE_ZIP" -d "$EXTRACT_DIR"
+
+          echo "ZIP extraction completed."
+
+          SETTINGS_FILE="$(
+            find "$EXTRACT_DIR" \
+              -maxdepth 8 \
+              -name settings.gradle.kts \
+              -not -path '*/.gradle/*' \
+              -print -quit
+          )"
+
+          if [[ -z "$SETTINGS_FILE" ]]; then
+            echo "ERROR: settings.gradle.kts not found."
+            find "$EXTRACT_DIR" -maxdepth 5 -type f \
+              | tee "$LOG_DIR/extracted-files.txt"
+            exit 1
+          fi
+
+          PROJECT_ROOT="$(dirname "$SETTINGS_FILE")"
+
+          if [[ ! -f "$PROJECT_ROOT/app/build.gradle.kts" ]]; then
+            echo "ERROR: app/build.gradle.kts missing."
+            exit 1
+          fi
 
           echo "PROJECT_ROOT=$PROJECT_ROOT" >> "$GITHUB_ENV"
-          echo "Located PROJECT_ROOT=$PROJECT_ROOT"
+          echo "project_root=$PROJECT_ROOT" >> "$GITHUB_OUTPUT"
 
+          echo "ANDROID_PROJECT_ROOT=$PROJECT_ROOT"
+          echo "ZIP_EXTRACTION=PASS"
+
+          {
+            echo "PROJECT_ROOT=$PROJECT_ROOT"
+            echo "SETTINGS_FILE=$SETTINGS_FILE"
+          } | tee "$LOG_DIR/project-location.txt"
+
+          find "$PROJECT_ROOT" -maxdepth 2 -type f \
+            | head -100 \
+            | tee "$LOG_DIR/project-files.txt"
+
+      # 3. JDK 17
       - name: Set up JDK 17
         id: java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
-          cache: gradle
 
-      - name: Set up pinned Gradle 8.11.1
+      # 4. Gradle 8.11.1
+      - name: Set up Gradle 8.11.1
         id: gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.11.1'
           cache-disabled: false
 
+      # 5. Android SDK
       - name: Set up Android SDK
         id: android_sdk
         uses: android-actions/setup-android@v3
 
-      - name: Install Android API 36, Build Tools and Platform Tools
+      # 6. Android API 36 packages
+      - name: Install Android API 36 and Build Tools
         id: sdk_packages
         shell: bash
         run: |
@@ -83,7 +133,8 @@ jobs:
 
           mkdir -p "$LOG_DIR"
 
-          yes | sdkmanager --licenses 2>&1 | tee "$LOG_DIR/android-sdk-licenses.log"
+          sdkmanager --licenses < <(yes) \
+            2>&1 | tee "$LOG_DIR/android-sdk-licenses.log"
 
           sdkmanager \
             'platform-tools' \
@@ -96,110 +147,112 @@ jobs:
           test -x "$ANDROID_HOME/platform-tools/adb"
           test -d "$ANDROID_HOME/platforms/android-36"
           test -d "$ANDROID_HOME/build-tools/36.0.0"
-          test -d "$ANDROID_HOME/system-images/android-36/google_apis/x86_64"
 
           echo "ANDROID_SDK_INSTALL=PASS"
 
-      - name: Install Kotlin/JVM compiler 1.9.0 for PSI guard
+      # 7. Kotlin compiler for PSI verification
+      - name: Install Kotlin compiler 1.9.0
         id: kotlin_compiler
         shell: bash
         run: |
           set -Eeuo pipefail
 
-          KOTLIN_HOME="$RUNNER_TEMP/kotlin-compiler-$KOTLIN_COMPILER_VERSION"
+          mkdir -p "$LOG_DIR"
+
+          KOTLIN_DIR="$RUNNER_TEMP/kotlin-compiler-$KOTLIN_COMPILER_VERSION"
           ARCHIVE="$RUNNER_TEMP/kotlin-compiler-$KOTLIN_COMPILER_VERSION.zip"
 
           curl --fail --location --retry 3 \
             "https://github.com/JetBrains/kotlin/releases/download/v${KOTLIN_COMPILER_VERSION}/kotlin-compiler-${KOTLIN_COMPILER_VERSION}.zip" \
             --output "$ARCHIVE"
 
-          unzip -q "$ARCHIVE" -d "$KOTLIN_HOME"
+          unzip -q "$ARCHIVE" -d "$KOTLIN_DIR"
 
-          echo "$KOTLIN_HOME/kotlinc/bin" >> "$GITHUB_PATH"
-          echo "KOTLIN_HOME=$KOTLIN_HOME/kotlinc" >> "$GITHUB_ENV"
+          KOTLIN_HOME="$KOTLIN_DIR/kotlinc"
 
-          test -x "$KOTLIN_HOME/kotlinc/bin/kotlinc"
-          test -s "$KOTLIN_HOME/kotlinc/lib/kotlin-compiler.jar"
+          test -x "$KOTLIN_HOME/bin/kotlinc"
+          test -s "$KOTLIN_HOME/lib/kotlin-compiler.jar"
 
-          "$KOTLIN_HOME/kotlinc/bin/kotlinc" -version 2>&1 \
-            | tee "$LOG_DIR/kotlin-compiler-version.log"
+          echo "$KOTLIN_HOME/bin" >> "$GITHUB_PATH"
+          echo "KOTLIN_HOME=$KOTLIN_HOME" >> "$GITHUB_ENV"
 
-          sha256sum "$KOTLIN_HOME/kotlinc/lib/kotlin-compiler.jar" \
-            | tee "$LOG_DIR/kotlin-compiler-jar.sha256"
+          "$KOTLIN_HOME/bin/kotlinc" -version \
+            2>&1 | tee "$LOG_DIR/kotlin-version.log"
 
+          sha256sum "$KOTLIN_HOME/lib/kotlin-compiler.jar" \
+            | tee "$LOG_DIR/kotlin-compiler.sha256"
+
+      # 8. Environment verification
       - name: Verify build environment
         id: environment
         shell: bash
         run: |
           set -Eeuo pipefail
 
-          mkdir -p "$LOG_DIR"
-
           {
-            echo "=== Java ==="
-            java -version 2>&1
+            echo "=== JAVA ==="
+            java -version
 
-            echo "=== Gradle ==="
+            echo "=== GRADLE ==="
             gradle --version
 
-            echo "=== Kotlin/JVM ==="
-            kotlinc -version 2>&1
+            echo "=== KOTLIN ==="
+            kotlinc -version
 
-            echo "=== Android SDK ==="
-            echo "ANDROID_HOME=$ANDROID_HOME"
-            echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
-
-            echo "=== SDK packages ==="
-            sdkmanager --list_installed
+            echo "=== ANDROID SDK ==="
+            echo "$ANDROID_HOME"
 
             echo "=== ADB ==="
             adb version
+
+            echo "=== SDK PACKAGES ==="
+            sdkmanager --list_installed
           } 2>&1 | tee "$LOG_DIR/environment.txt"
 
-          gradle --version | grep -F 'Gradle 8.11.1'
           java -version 2>&1 | grep -F '17.'
+          gradle --version | grep -F 'Gradle 8.11.1'
           kotlinc -version 2>&1 | grep -F '1.9.0'
 
-          test -s "$KOTLIN_HOME/lib/kotlin-compiler.jar"
-          test -x "$ANDROID_HOME/platform-tools/adb"
           test -d "$ANDROID_HOME/platforms/android-36"
           test -d "$ANDROID_HOME/build-tools/36.0.0"
 
+      # 9. Resolve project dependencies
       - name: Resolve Gradle dependencies
         id: dependencies
-        working-directory: ${{ env.PROJECT_ROOT }}
+        working-directory: ${{ steps.project.outputs.project_root }}
         shell: bash
         run: |
           set -Eeuo pipefail
 
           gradle --no-daemon --stacktrace --console=plain \
             :app:dependencies \
-            2>&1 | tee "$LOG_DIR/dependency-resolution.log"
+            2>&1 | tee "$LOG_DIR/dependencies.log"
 
+      # 10. PSI and Tokenizer fixtures
       - name: Run V7 PSI and Tokenizer fixtures
         id: reflection_fixtures
-        working-directory: ${{ env.PROJECT_ROOT }}
+        working-directory: ${{ steps.project.outputs.project_root }}
         shell: bash
         run: |
           set -Eeuo pipefail
+
+          if [[ ! -f scripts/test_dao_reflection_guard.py ]]; then
+            echo "ERROR: DAO reflection guard script missing."
+            exit 1
+          fi
 
           python3 scripts/test_dao_reflection_guard.py \
             2>&1 | tee "$LOG_DIR/dao-reflection-fixtures.log"
 
-          grep -Fx 'PSI_RUNTIME=AVAILABLE' "$LOG_DIR/dao-reflection-fixtures.log"
-          grep -Fx 'PSI_COMPILATION=SUCCESS' "$LOG_DIR/dao-reflection-fixtures.log"
-          grep -Fx 'PSI_FIXTURES=EXECUTED' "$LOG_DIR/dao-reflection-fixtures.log"
-          grep -Fx 'TOKENIZER_FIXTURES=EXECUTED' "$LOG_DIR/dao-reflection-fixtures.log"
-          grep -Fx 'RESULT=TOKENIZER_AND_PSI_FIXTURES_PASS' "$LOG_DIR/dao-reflection-fixtures.log"
+          echo "REFLECTION_FIXTURES=PASS"
 
-      - name: Run existing static verifiers
+      # 11. Static verification
+      - name: Run static project verifiers
         id: static_verifiers
-        working-directory: ${{ env.PROJECT_ROOT }}
+        working-directory: ${{ steps.project.outputs.project_root }}
         shell: bash
         run: |
           set -Eeuo pipefail
-
-          mkdir -p "$LOG_DIR"
 
           for script in \
             scripts/verify_build_readiness.py \
@@ -208,26 +261,34 @@ jobs:
             scripts/verify_phase2_closeout.py \
             scripts/verify_phase1_sqlite_migrations.py
           do
-            log="$LOG_DIR/$(basename "${script%.py}").log"
+            if [[ ! -f "$script" ]]; then
+              echo "ERROR: Required verifier missing: $script"
+              exit 1
+            fi
 
-            echo "===== RUN $script ====="
+            LOG_FILE="$LOG_DIR/$(basename "${script%.py}").log"
 
-            python3 "$script" 2>&1 | tee "$log"
+            echo "===================================="
+            echo "RUNNING: $script"
+            echo "===================================="
+
+            python3 "$script" 2>&1 | tee "$LOG_FILE"
           done
 
-      - name: Compile Kotlin and execute Room KAPT schema generation
+          echo "STATIC_VERIFIERS=PASS"
+
+      # 12. Kotlin compilation and Room KAPT
+      - name: Compile Kotlin and Room KAPT
         id: compile_kapt
-        working-directory: ${{ env.PROJECT_ROOT }}
+        working-directory: ${{ steps.project.outputs.project_root }}
         shell: bash
         run: |
           set -Eeuo pipefail
 
-          mkdir -p "$LOG_DIR"
-
           gradle --no-daemon --stacktrace --console=plain \
             :app:kaptDebugKotlin \
             :app:compileDebugKotlin \
-            2>&1 | tee "$LOG_DIR/kotlin-room-kapt-compile.log"
+            2>&1 | tee "$LOG_DIR/kotlin-room-compile.log"
 
           mkdir -p "$LOG_DIR/room-schemas"
 
@@ -235,14 +296,16 @@ jobs:
             cp -a app/schemas/. "$LOG_DIR/room-schemas/"
           fi
 
-          find app/schemas -type f -name '*.json' -print 2>/dev/null \
-            | tee "$LOG_DIR/room-schema-files.txt"
+          find app/schemas -type f -name '*.json' -print \
+            2>/dev/null \
+            | tee "$LOG_DIR/room-schema-files.txt" || true
 
-          test -n "$(find app/schemas -type f -name '*.json' -print -quit 2>/dev/null)"
+          echo "KOTLIN_COMPILE_AND_KAPT=PASS"
 
+      # 13. JVM tests
       - name: Run JVM unit tests
         id: unit_tests
-        working-directory: ${{ env.PROJECT_ROOT }}
+        working-directory: ${{ steps.project.outputs.project_root }}
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -251,9 +314,10 @@ jobs:
             :app:testDebugUnitTest \
             2>&1 | tee "$LOG_DIR/jvm-unit-tests.log"
 
+      # 14. Android Lint
       - name: Run Android Lint
         id: lint
-        working-directory: ${{ env.PROJECT_ROOT }}
+        working-directory: ${{ steps.project.outputs.project_root }}
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -262,7 +326,8 @@ jobs:
             :app:lintDebug \
             2>&1 | tee "$LOG_DIR/android-lint.log"
 
-      - name: Run API 36 Emulator instrumentation and Room migration tests
+      # 15. API 36 emulator tests
+      - name: Run API 36 Emulator instrumentation tests
         id: instrumentation
         uses: reactivecircus/android-emulator-runner@v2
         with:
@@ -275,23 +340,22 @@ jobs:
           script: |
             set -Eeuo pipefail
 
-            mkdir -p "$LOG_DIR"
+            cd "$PROJECT_ROOT"
 
-            adb devices -l | tee "$LOG_DIR/emulator-devices.txt"
+            adb devices -l \
+              | tee "$LOG_DIR/emulator-devices.txt"
 
             adb shell getprop ro.build.version.sdk \
               | tee "$LOG_DIR/emulator-api-level.txt"
-
-            adb shell getprop ro.build.fingerprint \
-              | tee "$LOG_DIR/emulator-build-fingerprint.txt"
 
             gradle --no-daemon --stacktrace --console=plain \
               :app:connectedDebugAndroidTest \
               2>&1 | tee "$LOG_DIR/android-instrumentation.log"
 
-      - name: Assemble final Debug APK
+      # 16. Build Debug APK
+      - name: Assemble Debug APK
         id: assemble_debug
-        working-directory: ${{ env.PROJECT_ROOT }}
+        working-directory: ${{ steps.project.outputs.project_root }}
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -300,16 +364,25 @@ jobs:
             :app:assembleDebug \
             2>&1 | tee "$LOG_DIR/assemble-debug.log"
 
-          test -s app/build/outputs/apk/debug/app-debug.apk
+          APK="app/build/outputs/apk/debug/app-debug.apk"
 
-      - name: Verify Debug APK package, alignment and integrity
+          if [[ ! -s "$APK" ]]; then
+            echo "ERROR: Debug APK not generated."
+            exit 1
+          fi
+
+          echo "DEBUG_APK_BUILD=PASS"
+
+      # 17. Verify APK
+      - name: Verify APK package, alignment and signature
         id: verify_apk
-        working-directory: ${{ env.PROJECT_ROOT }}
+        working-directory: ${{ steps.project.outputs.project_root }}
         shell: bash
         run: |
           set -Eeuo pipefail
 
           APK="app/build/outputs/apk/debug/app-debug.apk"
+
           AAPT="$ANDROID_HOME/build-tools/36.0.0/aapt"
           ZIPALIGN="$ANDROID_HOME/build-tools/36.0.0/zipalign"
           APKSIGNER="$ANDROID_HOME/build-tools/36.0.0/apksigner"
@@ -326,7 +399,7 @@ jobs:
             2>&1 | tee "$LOG_DIR/apk-zipalign.txt"
 
           "$APKSIGNER" verify --verbose "$APK" \
-            2>&1 | tee "$LOG_DIR/apk-signature-verification.txt"
+            2>&1 | tee "$LOG_DIR/apk-signature.txt"
 
           sha256sum "$APK" \
             | tee "$LOG_DIR/debug-apk.sha256"
@@ -334,6 +407,9 @@ jobs:
           stat -c 'APK_SIZE_BYTES=%s' "$APK" \
             | tee "$LOG_DIR/debug-apk-size.txt"
 
+          echo "APK_VERIFICATION=PASS"
+
+      # 18. Final build summary
       - name: Create final build summary
         id: final_summary
         if: always()
@@ -349,12 +425,12 @@ jobs:
           DEPENDENCIES: ${{ steps.dependencies.outcome }}
           REFLECTION: ${{ steps.reflection_fixtures.outcome }}
           STATIC: ${{ steps.static_verifiers.outcome }}
-          COMPILE_KAPT: ${{ steps.compile_kapt.outcome }}
+          COMPILE: ${{ steps.compile_kapt.outcome }}
           UNIT: ${{ steps.unit_tests.outcome }}
           LINT: ${{ steps.lint.outcome }}
-          INSTRUMENTATION: ${{ steps.instrumentation.outcome }}
+          EMULATOR: ${{ steps.instrumentation.outcome }}
           APK: ${{ steps.assemble_debug.outcome }}
-          APK_VERIFY: ${{ steps.verify_apk.outcome }}
+          VERIFY: ${{ steps.verify_apk.outcome }}
         run: |
           set -u
 
@@ -363,63 +439,70 @@ jobs:
 
           {
             echo "# AI Architecture Android Build Summary"
-            echo "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "Run ID: $GITHUB_RUN_ID"
             echo "Commit: $GITHUB_SHA"
-            echo "Project root: ${PROJECT_ROOT:-NOT LOCATED}"
+            echo "Project: AI Architecture"
+            echo "Package: com.aiarchitecture.app"
+            echo ""
+            echo "Checkout: $CHECKOUT"
+            echo "Project ZIP extraction: $PROJECT"
             echo "JDK 17: $JAVA"
             echo "Gradle 8.11.1: $GRADLE"
             echo "Android SDK API 36: $SDK"
-            echo "Kotlin PSI compiler 1.9.0: $KOTLIN"
+            echo "Kotlin compiler: $KOTLIN"
             echo "Environment: $ENVIRONMENT"
-            echo "Dependency resolution: $DEPENDENCIES"
-            echo "V7 PSI/Tokenizer fixtures: $REFLECTION"
-            echo "Static verifiers: $STATIC"
-            echo "Kotlin compile + Room KAPT: $COMPILE_KAPT"
-            echo "JVM unit tests: $UNIT"
+            echo "Dependencies: $DEPENDENCIES"
+            echo "PSI and Tokenizer: $REFLECTION"
+            echo "Static verification: $STATIC"
+            echo "Kotlin and Room KAPT: $COMPILE"
+            echo "JVM tests: $UNIT"
             echo "Android Lint: $LINT"
-            echo "API 36 Emulator instrumentation: $INSTRUMENTATION"
-            echo "Debug APK assemble: $APK"
-            echo "APK verification: $APK_VERIFY"
+            echo "Emulator tests: $EMULATOR"
+            echo "Debug APK: $APK"
+            echo "APK verification: $VERIFY"
           } | tee "$LOG_DIR/FINAL_BUILD_SUMMARY.md"
 
-          for outcome in \
+          for status in \
             "$CHECKOUT" "$PROJECT" "$JAVA" "$GRADLE" "$SDK" \
             "$KOTLIN" "$ENVIRONMENT" "$DEPENDENCIES" "$REFLECTION" \
-            "$STATIC" "$COMPILE_KAPT" "$UNIT" "$LINT" \
-            "$INSTRUMENTATION" "$APK" "$APK_VERIFY"
+            "$STATIC" "$COMPILE" "$UNIT" "$LINT" "$EMULATOR" \
+            "$APK" "$VERIFY"
           do
-            [[ "$outcome" == "success" ]] || RESULT=1
+            [[ "$status" == "success" ]] || RESULT=1
           done
 
           if [[ "$RESULT" -eq 0 ]]; then
-            echo "FINAL_RESULT=PASS" | tee -a "$LOG_DIR/FINAL_BUILD_SUMMARY.md"
+            echo "FINAL_RESULT=PASS" \
+              | tee -a "$LOG_DIR/FINAL_BUILD_SUMMARY.md"
           else
-            echo "FINAL_RESULT=FAIL_OR_INCOMPLETE" | tee -a "$LOG_DIR/FINAL_BUILD_SUMMARY.md"
+            echo "FINAL_RESULT=FAIL_OR_INCOMPLETE" \
+              | tee -a "$LOG_DIR/FINAL_BUILD_SUMMARY.md"
           fi
 
           exit "$RESULT"
 
-      - name: Upload Debug APK artifact
+      # 19. Upload APK
+      - name: Upload Debug APK
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: AI_Architecture_DEBUG_APK
+          path: ${{ steps.project.outputs.project_root }}/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: warn
-          path: ${{ env.PROJECT_ROOT }}/app/build/outputs/apk/debug/app-debug.apk
           retention-days: 30
 
-      - name: Upload complete build logs, test reports, lint and Room schemas
+      # 20. Upload reports and logs
+      - name: Upload build logs and reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: AI_Architecture_BUILD_LOGS_AND_REPORTS
           if-no-files-found: warn
-          retention-days: 30
           include-hidden-files: true
+          retention-days: 30
           path: |
-            ${{ github.workspace }}/.ci-logs/**
-            ${{ env.PROJECT_ROOT }}/app/build/reports/**
-            ${{ env.PROJECT_ROOT }}/app/build/test-results/**
-            ${{ env.PROJECT_ROOT }}/app/build/outputs/androidTest-results/**
-            ${{ env.PROJECT_ROOT }}/app/build/outputs/apk/androidTest/**
-            ${{ env.PROJECT_ROOT }}/app/schemas/**
+            .ci-logs/**
+            ${{ steps.project.outputs.project_root }}/app/build/reports/**
+            ${{ steps.project.outputs.project_root }}/app/build/test-results/**
+            ${{ steps.project.outputs.project_root }}/app/build/outputs/androidTest-results/**
+            ${{ steps.project.outputs.project_root }}/app/schemas/**

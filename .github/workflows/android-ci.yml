@@ -18,7 +18,7 @@ jobs:
   android:
     name: Build, JVM Tests, Lint and Emulator Tests
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
 
     env:
       STATUS_DIR: ${{ github.workspace }}/.ci-ai-architecture-status
@@ -36,7 +36,7 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Install Android SDK without deprecated tools
+      - name: Install Android SDK
         id: sdk
         shell: bash
         run: |
@@ -44,15 +44,11 @@ jobs:
 
           ANDROID_HOME="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
 
-          if [[ ! -d "$ANDROID_HOME/cmdline-tools" ]]; then
-            echo "::error::Android command-line tools directory missing"
-            exit 1
-          fi
-
-          SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager -perm -u+x -print -quit)"
+          SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" \
+            -type f -name sdkmanager -perm -u+x -print -quit)"
 
           if [[ -z "$SDKMANAGER" ]]; then
-            echo "::error::sdkmanager executable not found"
+            echo "::error::sdkmanager not found"
             exit 1
           fi
 
@@ -69,7 +65,7 @@ jobs:
           set -e
 
           if [[ "$LICENSE_STATUS" -ne 0 ]]; then
-            echo "::error::SDK license acceptance failed"
+            echo "::error::Android SDK licenses failed"
             exit "$LICENSE_STATUS"
           fi
 
@@ -88,8 +84,7 @@ jobs:
           test -d "$ANDROID_HOME/build-tools/36.0.0"
           test -d "$ANDROID_HOME/system-images/android-35/google_apis/x86_64"
 
-          "$ANDROID_HOME/platform-tools/adb" version
-
+          adb version
           echo "ANDROID_SDK_INSTALL=PASS"
 
       - name: Extract and validate CI bundle
@@ -142,7 +137,7 @@ jobs:
           bash -n "$EMULATOR_SCRIPT"
           python3 -m py_compile "$REPORT_SCRIPT"
 
-          echo "ZIP extraction PASS"
+          echo "ZIP_EXTRACTION=PASS"
 
       - name: Set up Gradle 8.11.1
         id: gradle
@@ -169,8 +164,6 @@ jobs:
 
           test -s "$WORKFLOW_DEST"
 
-          echo "Workflow prepared for project verifier"
-
       - name: Verify source and run static verifiers
         id: static
         shell: bash
@@ -184,7 +177,7 @@ jobs:
           python3 scripts/verify_phase2_closeout.py
           python3 scripts/verify_build_readiness.py
 
-          echo "Static verification PASS"
+          echo "STATIC_VERIFICATION=PASS"
 
       - name: Verify Android instrumentation configuration
         id: test_config
@@ -206,7 +199,7 @@ jobs:
           find "$PROJECT_ROOT/app/src/androidTest" \
             -type f \( -name '*.kt' -o -name '*.java' \) -print
 
-          echo "Instrumentation configuration PASS"
+          echo "INSTRUMENTATION_CONFIG=PASS"
 
       - name: Assemble Debug and Android Test APKs
         id: assemble
@@ -256,7 +249,6 @@ jobs:
 
           echo "ANDROID_LINT=PASS"
 
-      # Required task: :app:connectedDebugAndroidTest
       - name: Boot API 35 Emulator and run instrumentation tests
         id: emulator
         if: steps.assemble.outcome == 'success'
@@ -280,26 +272,42 @@ jobs:
           AVD_NAME="ai_architecture_api35"
           SERIAL="emulator-5554"
 
-          # Fixed AVD home directory
           export ANDROID_USER_HOME="$HOME/.android"
           export ANDROID_AVD_HOME="$ANDROID_USER_HOME/avd"
 
           mkdir -p "$ANDROID_AVD_HOME" "$STATUS_DIR"
 
-          echo "ANDROID_USER_HOME=$ANDROID_USER_HOME" >> "$GITHUB_ENV"
-          echo "ANDROID_AVD_HOME=$ANDROID_AVD_HOME" >> "$GITHUB_ENV"
-
           if [[ -z "$AVDMANAGER" || ! -x "$EMULATOR" || ! -x "$ADB" ]]; then
-            echo "::error::Android emulator tools are missing"
+            echo "::error::Emulator tools missing"
             exit 1
           fi
 
-          echo "Cleaning old AVD"
+          echo "Checking KVM permissions"
+
+          ACCEL_MODE="off"
+
+          if [[ -e /dev/kvm ]]; then
+            sudo chmod 666 /dev/kvm || true
+
+            if [[ -r /dev/kvm && -w /dev/kvm ]]; then
+              ACCEL_MODE="on"
+              echo "KVM hardware acceleration enabled"
+            else
+              echo "KVM permission unavailable; software mode selected"
+            fi
+          else
+            echo "KVM not available; software mode selected"
+          fi
+
+          echo "ANDROID_USER_HOME=$ANDROID_USER_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_AVD_HOME=$ANDROID_AVD_HOME" >> "$GITHUB_ENV"
+
+          echo "Removing old AVD"
 
           rm -rf "$ANDROID_AVD_HOME/$AVD_NAME.avd"
           rm -f "$ANDROID_AVD_HOME/$AVD_NAME.ini"
 
-          echo "Creating Android API 35 AVD"
+          echo "Creating API 35 AVD"
 
           printf 'no\n' | "$AVDMANAGER" create avd \
             --force \
@@ -308,34 +316,24 @@ jobs:
             --device "pixel_2" \
             --path "$ANDROID_AVD_HOME/$AVD_NAME.avd"
 
-          echo "Checking AVD configuration"
+          test -s "$ANDROID_AVD_HOME/$AVD_NAME.ini"
+          test -d "$ANDROID_AVD_HOME/$AVD_NAME.avd"
 
-          if [[ ! -s "$ANDROID_AVD_HOME/$AVD_NAME.ini" ]]; then
-            echo "::error::AVD INI file missing"
-            find "$ANDROID_AVD_HOME" -maxdepth 2 -type f -print
-            exit 1
-          fi
-
-          if [[ ! -d "$ANDROID_AVD_HOME/$AVD_NAME.avd" ]]; then
-            echo "::error::AVD directory missing"
-            exit 1
-          fi
-
-          echo "Available Android Virtual Devices:"
           "$EMULATOR" -list-avds
 
           if ! "$EMULATOR" -list-avds | grep -Fxq "$AVD_NAME"; then
-            echo "::error::Created AVD is not visible to emulator"
+            echo "::error::AVD not registered"
             exit 1
           fi
 
           "$ADB" start-server
 
-          echo "Starting Android emulator"
+          echo "Starting emulator using acceleration: $ACCEL_MODE"
 
           nohup "$EMULATOR" \
             -avd "$AVD_NAME" \
             -port 5554 \
+            -accel "$ACCEL_MODE" \
             -no-window \
             -no-audio \
             -no-boot-anim \
@@ -346,7 +344,6 @@ jobs:
             > "$STATUS_DIR/emulator-console.log" 2>&1 &
 
           EMULATOR_PID=$!
-
           echo "$EMULATOR_PID" > "$STATUS_DIR/emulator.pid"
 
           cleanup_on_failure() {
@@ -369,13 +366,11 @@ jobs:
 
           trap cleanup_on_failure EXIT
 
-          echo "Waiting for ADB online"
-
           ONLINE=0
 
           for attempt in $(seq 1 180); do
             if ! kill -0 "$EMULATOR_PID" 2>/dev/null; then
-              echo "::error::Emulator exited during startup"
+              echo "::error::Emulator process exited"
               exit 1
             fi
 
@@ -395,11 +390,9 @@ jobs:
           done
 
           if [[ "$ONLINE" -ne 1 ]]; then
-            echo "::error::Emulator did not become ADB-online"
+            echo "::error::ADB connection timed out"
             exit 1
           fi
-
-          echo "Waiting for Android boot"
 
           BOOTED=0
 
@@ -416,7 +409,7 @@ jobs:
           done
 
           if [[ "$BOOTED" -ne 1 ]]; then
-            echo "::error::Android framework boot timed out"
+            echo "::error::Android boot timed out"
             exit 1
           fi
 
@@ -424,11 +417,9 @@ jobs:
             | tr -d '\r')"
 
           if [[ "$API_LEVEL" != "35" ]]; then
-            echo "::error::Expected Android API 35, got $API_LEVEL"
+            echo "::error::Expected API 35, got $API_LEVEL"
             exit 1
           fi
-
-          echo "Waiting for Android Package Manager"
 
           PM_READY=0
 
@@ -443,17 +434,17 @@ jobs:
           done
 
           if [[ "$PM_READY" -ne 1 ]]; then
-            echo "::error::Android Package Manager not ready"
+            echo "::error::Package Manager not ready"
             exit 1
           fi
 
-          echo "EMULATOR_BOOT=PASS API=$API_LEVEL SERIAL=$SERIAL"
-
-          echo "Starting Android instrumentation tests"
+          echo "EMULATOR_BOOT=PASS"
+          echo "ANDROID_API=$API_LEVEL"
+          echo "ACCELERATION=$ACCEL_MODE"
 
           bash "$EMULATOR_SCRIPT"
 
-          echo "INSTRUMENTATION_STEP=PASS"
+          echo "INSTRUMENTATION=PASS"
 
       - name: Verify APKs and test reports
         id: reports
@@ -488,7 +479,6 @@ jobs:
           set -u
 
           mkdir -p "$STATUS_DIR"
-
           RESULT=0
 
           {
@@ -509,19 +499,9 @@ jobs:
           } | tee "$STATUS_DIR/final-ci-summary.txt"
 
           for VALUE in \
-            "$CHECKOUT" \
-            "$JAVA" \
-            "$SDK" \
-            "$SOURCE" \
-            "$GRADLE" \
-            "$WORKFLOW_PREPARE" \
-            "$STATIC" \
-            "$TEST_CONFIG" \
-            "$ASSEMBLE" \
-            "$UNIT" \
-            "$LINT" \
-            "$EMULATOR" \
-            "$REPORTS"
+            "$CHECKOUT" "$JAVA" "$SDK" "$SOURCE" "$GRADLE" \
+            "$WORKFLOW_PREPARE" "$STATIC" "$TEST_CONFIG" \
+            "$ASSEMBLE" "$UNIT" "$LINT" "$EMULATOR" "$REPORTS"
           do
             if [[ "$VALUE" != "success" ]]; then
               RESULT=1

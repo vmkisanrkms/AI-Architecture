@@ -634,10 +634,153 @@ jobs:
           echo "ADB_SERVER_RESET=PASS" \
             | tee "$LOG_DIR/adb-reset.log"
 
-      # 20. API 36 emulator instrumentation tests
+      # 20. Prepare instrumentation script
+      - name: Prepare API 36 instrumentation script
+        id: prepare_instrumentation
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          SCRIPT_FILE="$RUNNER_TEMP/ai-architecture-instrumentation.sh"
+
+          cat > "$SCRIPT_FILE" <<'BASH'
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+
+          cd "$PROJECT_ROOT"
+          mkdir -p "$LOG_DIR"
+
+          DEVICE="${ANDROID_SERIAL:-emulator-${EMULATOR_PORT:-5554}}"
+
+          echo "=== Emulator device discovery ==="
+
+          adb devices -l | tee "$LOG_DIR/emulator-devices-before-tests.log"
+
+          echo "=== Verify emulator connection ==="
+
+          BOOT_OK=0
+          OFFLINE_COUNT=0
+          BOOT_COMPLETED_COUNT=0
+          ADB_RESTARTED=0
+
+          for ATTEMPT in $(seq 1 180); do
+
+            STATE="$(adb devices | awk -v d="$DEVICE" '$1 == d {print $2}')"
+
+            if [[ "$STATE" == "offline" ]]; then
+
+              OFFLINE_COUNT=$((OFFLINE_COUNT + 1))
+              echo "ADB offline recovery: $OFFLINE_COUNT"
+
+              adb reconnect offline >/dev/null 2>&1 || true
+
+              if (( OFFLINE_COUNT >= 12 && ADB_RESTARTED == 0 )); then
+                adb kill-server || true
+                sleep 3
+                adb start-server || true
+                ADB_RESTARTED=1
+                OFFLINE_COUNT=0
+              fi
+
+            elif [[ "$STATE" == "device" ]]; then
+
+              STATUS="$(adb -s "$DEVICE" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)"
+
+              if [[ "$STATUS" == "1" ]]; then
+                BOOT_COMPLETED_COUNT=$((BOOT_COMPLETED_COUNT + 1))
+
+                if (( BOOT_COMPLETED_COUNT >= 3 )); then
+                  BOOT_OK=1
+                  break
+                fi
+              else
+                BOOT_COMPLETED_COUNT=0
+              fi
+
+            else
+              BOOT_COMPLETED_COUNT=0
+            fi
+
+            if (( ATTEMPT % 12 == 0 )); then
+              echo "Waiting for emulator: attempt $ATTEMPT"
+              echo "ADB state: ${STATE:-missing}"
+              adb devices -l || true
+            fi
+
+            sleep 5
+          done
+
+          if [[ "$BOOT_OK" -ne 1 ]]; then
+            echo "ERROR: Emulator did not become ready."
+            adb devices -l || true
+            adb logcat -d -t 1000 > "$LOG_DIR/emulator-logcat-failure.log" 2>&1 || true
+            exit 1
+          fi
+
+          echo "=== Verify Android API ==="
+
+          API_LEVEL="$(adb -s "$DEVICE" shell getprop ro.build.version.sdk | tr -d '\r')"
+
+          echo "EMULATOR_API_LEVEL=$API_LEVEL" | tee "$LOG_DIR/emulator-api-level.log"
+
+          if [[ "$API_LEVEL" != "36" ]]; then
+            echo "ERROR: Expected API 36, got $API_LEVEL"
+            exit 1
+          fi
+
+          adb -s "$DEVICE" shell settings put global window_animation_scale 0
+          adb -s "$DEVICE" shell settings put global transition_animation_scale 0
+          adb -s "$DEVICE" shell settings put global animator_duration_scale 0
+
+          echo "EMULATOR_BOOT=PASS" | tee "$LOG_DIR/emulator-boot-status.log"
+
+          echo "=== Run Android instrumentation tests ==="
+
+          gradle --no-daemon --stacktrace --console=plain \
+            :app:connectedDebugAndroidTest \
+            2>&1 | tee "$LOG_DIR/android-instrumentation.log"
+
+          RESULTS="app/build/outputs/androidTest-results/connected"
+
+          if [[ ! -d "$RESULTS" ]]; then
+            echo "ERROR: Instrumentation result directory missing."
+            exit 1
+          fi
+
+          find "$RESULTS" -type f -name '*.xml' -print \
+            | tee "$LOG_DIR/instrumentation-xml-files.log"
+
+          grep -R -q 'ComponentDatabaseMigrationTest' "$RESULTS" || {
+            echo "ERROR: Room migration test result missing."
+            exit 1
+          }
+
+          grep -R -q 'ComponentPersistenceRoundTripTest' "$RESULTS" || {
+            echo "ERROR: Persistence round-trip test result missing."
+            exit 1
+          }
+
+          echo "ANDROID_INSTRUMENTATION=PASS" \
+            | tee "$LOG_DIR/instrumentation-status.log"
+          BASH
+
+          chmod +x "$SCRIPT_FILE"
+
+          bash -n "$SCRIPT_FILE"
+
+          test -s "$SCRIPT_FILE"
+
+          echo "INSTRUMENTATION_SCRIPT=$SCRIPT_FILE" \
+            | tee "$LOG_DIR/instrumentation-script-check.log"
+
+          echo "INSTRUMENTATION_SCRIPT_VALID=PASS" \
+            | tee -a "$LOG_DIR/instrumentation-script-check.log"
+
+      # 21. Run emulator instrumentation tests
       - name: Run API 36 emulator instrumentation tests
         id: instrumentation
         uses: reactivecircus/android-emulator-runner@v2
+        timeout-minutes: 45
         with:
           api-level: 36
           target: google_apis
@@ -656,180 +799,9 @@ jobs:
             -wipe-data
             -camera-back none
             -camera-front none
-          pre-emulator-launch-script: |
-            set -eu
+          script: bash "$RUNNER_TEMP/ai-architecture-instrumentation.sh"
 
-            if [ -e /dev/kvm ]; then
-              sudo chmod 666 /dev/kvm
-              test -r /dev/kvm
-              test -w /dev/kvm
-            else
-              echo "ERROR: KVM device missing before emulator launch."
-              exit 1
-            fi
-          script: |
-            # The action uses /usr/bin/sh for this script.
-            # Run Bash explicitly to support pipefail and Bash syntax.
-            bash -Eeuo pipefail <<'BASH'
-
-            cd "$PROJECT_ROOT"
-
-            mkdir -p "$LOG_DIR"
-
-            DEVICE="${ANDROID_SERIAL:-emulator-${EMULATOR_PORT:-5554}}"
-
-            echo "=== Emulator device discovery ==="
-
-            adb devices -l \
-              | tee "$LOG_DIR/emulator-devices-before-tests.log"
-
-            echo "=== Wait for emulator and recover ADB ==="
-
-            BOOT_OK=0
-            OFFLINE_COUNT=0
-            ADB_RESTARTED=0
-            BOOT_COMPLETED_COUNT=0
-
-            for ATTEMPT in $(seq 1 180); do
-
-              STATE="$(
-                adb devices \
-                  | awk -v d="$DEVICE" '$1 == d {print $2}'
-              )"
-
-              if [[ "$STATE" == "offline" ]]; then
-
-                OFFLINE_COUNT=$((OFFLINE_COUNT + 1))
-
-                echo "ADB offline. Recovery attempt: $OFFLINE_COUNT"
-
-                adb reconnect offline \
-                  >/dev/null 2>&1 || true
-
-                if (( OFFLINE_COUNT >= 12 && ADB_RESTARTED == 0 )); then
-
-                  echo "Restarting ADB server..."
-
-                  adb kill-server || true
-                  sleep 3
-                  adb start-server || true
-
-                  ADB_RESTARTED=1
-                  OFFLINE_COUNT=0
-                fi
-
-              elif [[ "$STATE" == "device" ]]; then
-
-                BOOT_STATUS="$(
-                  adb -s "$DEVICE" shell getprop sys.boot_completed \
-                    2>/dev/null | tr -d '\r' || true
-                )"
-
-                if [[ "$BOOT_STATUS" == "1" ]]; then
-
-                  BOOT_COMPLETED_COUNT=$((BOOT_COMPLETED_COUNT + 1))
-
-                  if (( BOOT_COMPLETED_COUNT >= 3 )); then
-                    BOOT_OK=1
-                    break
-                  fi
-
-                else
-                  BOOT_COMPLETED_COUNT=0
-                fi
-
-              else
-                BOOT_COMPLETED_COUNT=0
-              fi
-
-              if (( ATTEMPT % 12 == 0 )); then
-                echo "Waiting for Android boot..."
-                echo "Attempt: $ATTEMPT"
-                echo "ADB state: ${STATE:-missing}"
-                adb devices -l || true
-              fi
-
-              sleep 5
-            done
-
-            if [[ "$BOOT_OK" -ne 1 ]]; then
-
-              echo "ERROR: Emulator boot did not complete."
-
-              adb devices -l || true
-
-              adb -s "$DEVICE" emu avd name || true
-
-              adb logcat -d -t 1000 \
-                > "$LOG_DIR/emulator-logcat-failure.log" 2>&1 || true
-
-              exit 1
-            fi
-
-            echo "=== Verify Android API ==="
-
-            API_LEVEL="$(
-              adb -s "$DEVICE" shell getprop ro.build.version.sdk \
-                | tr -d '\r'
-            )"
-
-            echo "EMULATOR_API_LEVEL=$API_LEVEL" \
-              | tee "$LOG_DIR/emulator-api-level.log"
-
-            if [[ "$API_LEVEL" != "36" ]]; then
-              echo "ERROR: Expected API 36, got $API_LEVEL"
-              exit 1
-            fi
-
-            adb -s "$DEVICE" shell settings put global \
-              window_animation_scale 0
-
-            adb -s "$DEVICE" shell settings put global \
-              transition_animation_scale 0
-
-            adb -s "$DEVICE" shell settings put global \
-              animator_duration_scale 0
-
-            echo "EMULATOR_BOOT=PASS" \
-              | tee "$LOG_DIR/emulator-boot-status.log"
-
-            echo "=== Run connected Android tests ==="
-
-            gradle \
-              --no-daemon \
-              --stacktrace \
-              --console=plain \
-              :app:connectedDebugAndroidTest \
-              2>&1 | tee "$LOG_DIR/android-instrumentation.log"
-
-            echo "=== Verify instrumentation reports ==="
-
-            RESULTS="app/build/outputs/androidTest-results/connected"
-
-            test -d "$RESULTS" || {
-              echo "ERROR: Instrumentation result directory missing."
-              exit 1
-            }
-
-            find "$RESULTS" -name '*.xml' -type f -print \
-              | tee "$LOG_DIR/instrumentation-xml-files.log"
-
-            grep -R -q 'ComponentDatabaseMigrationTest' "$RESULTS" || {
-              echo "ERROR: Room migration test result missing."
-              exit 1
-            }
-
-            grep -R -q 'ComponentPersistenceRoundTripTest' "$RESULTS" || {
-              echo "ERROR: Persistence round-trip test result missing."
-              exit 1
-            }
-
-            echo "ANDROID_INSTRUMENTATION=PASS" \
-              | tee "$LOG_DIR/instrumentation-status.log"
-
-            BASH
-
-      # 21. Final summary
+      # 22. Final summary
       - name: Create final build summary
         id: final_summary
         if: always()
@@ -854,6 +826,7 @@ jobs:
           S_APK_VERIFY: ${{ steps.verify_apk.outcome }}
           S_KVM: ${{ steps.kvm.outcome }}
           S_ADB: ${{ steps.adb_reset.outcome }}
+          S_SCRIPT: ${{ steps.prepare_instrumentation.outcome }}
           S_ANDROID: ${{ steps.instrumentation.outcome }}
         run: |
           set -Eeuo pipefail
@@ -867,7 +840,8 @@ jobs:
             "$S_SDK" "$S_PACKAGES" "$S_KOTLIN" "$S_ENV" \
             "$S_TASKS" "$S_DEPS" "$S_GUARD" "$S_STATIC" \
             "$S_COMPILE" "$S_JVM" "$S_LINT" "$S_APK" \
-            "$S_APK_VERIFY" "$S_KVM" "$S_ADB" "$S_ANDROID"; do
+            "$S_APK_VERIFY" "$S_KVM" "$S_ADB" \
+            "$S_SCRIPT" "$S_ANDROID"; do
 
             if [[ "$STATUS" != "success" ]]; then
               RESULT=FAIL_OR_INCOMPLETE
@@ -899,6 +873,7 @@ jobs:
             echo "APK verification: $S_APK_VERIFY"
             echo "KVM: $S_KVM"
             echo "ADB reset: $S_ADB"
+            echo "Instrumentation script: $S_SCRIPT"
             echo "Emulator tests: $S_ANDROID"
             echo ""
             echo "FINAL_RESULT=$RESULT"
@@ -906,11 +881,9 @@ jobs:
 
           echo "FINAL_RESULT=$RESULT" >> "$GITHUB_STEP_SUMMARY"
 
-          # The failed build/test step already determines job failure.
-          # Keep this summary step informational.
           exit 0
 
-      # 22. Collect artifacts
+      # 23. Collect artifacts
       - name: Collect APK, logs and reports
         id: collect_artifacts
         if: always()
@@ -952,7 +925,7 @@ jobs:
             done
           fi
 
-      # 23. Upload APK
+      # 24. Upload APK
       - name: Upload Debug APK
         id: upload_apk
         if: always()
@@ -963,7 +936,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
-      # 24. Upload reports
+      # 25. Upload reports
       - name: Upload build logs, tests and Room schemas
         id: upload_reports
         if: always()

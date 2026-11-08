@@ -360,7 +360,7 @@ jobs:
             python3 "$SCRIPT" 2>&1 | tee "$LOG"
           done
 
-      # 13. Kotlin compile and Room KAPT
+      # 13. Kotlin compile and Room schema generation
       - name: Compile Kotlin and Room KAPT
         id: compile_kapt
         working-directory: ${{ steps.project.outputs.project_root }}
@@ -368,28 +368,132 @@ jobs:
         run: |
           set -Eeuo pipefail
 
-          gradle --no-daemon --stacktrace --console=plain \
+          echo "Checking Room configuration..."
+
+          python3 - <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          gradle_file = pathlib.Path("app/build.gradle.kts")
+          source_file = pathlib.Path(
+              "app/src/main/java/com/aiarchitecture/app/data/local/AppDatabase.kt"
+          )
+
+          if not gradle_file.is_file() or not source_file.is_file():
+              print("ERROR: Room configuration files are missing.")
+              sys.exit(1)
+
+          gradle = gradle_file.read_text(encoding="utf-8")
+          source = source_file.read_text(encoding="utf-8")
+
+          checks = {
+              "KAPT plugin": r'org\.jetbrains\.kotlin\.kapt',
+              "Room compiler 2.7.2": r'room-compiler:2\.7\.2',
+              "Room schema location": r'room\.schemaLocation',
+              "KAPT correctErrorTypes": r'correctErrorTypes\s*=\s*true',
+              "Room version 3": r'version\s*=\s*3',
+              "Room exportSchema": r'exportSchema\s*=\s*true',
+          }
+
+          for label, pattern in checks.items():
+              content = gradle if label not in (
+                  "Room version 3", "Room exportSchema"
+              ) else source
+
+              if not re.search(pattern, content):
+                  print(f"ERROR: {label} configuration not found.")
+                  sys.exit(1)
+
+              print(f"{label}: PASS")
+
+          print("ROOM_CONFIGURATION=PASS")
+          PY
+
+          SCHEMA_DIR="app/schemas"
+
+          # Remove only generated schema output.
+          # Project source, migrations and database files remain untouched.
+          rm -rf "$SCHEMA_DIR"
+          mkdir -p "$SCHEMA_DIR"
+
+          echo "Running Room KAPT..."
+
+          gradle \
+            --no-daemon \
+            --no-build-cache \
+            --rerun-tasks \
+            --stacktrace \
+            --console=plain \
             :app:kaptDebugKotlin \
+            2>&1 | tee "$LOG_DIR/kotlin-room-kapt.log"
+
+          echo "Checking newly generated Room schema..."
+
+          find "$SCHEMA_DIR" \
+            -type f -name '*.json' -print \
+            | tee "$LOG_DIR/room-schema-files.log"
+
+          if ! grep -q '\.json$' "$LOG_DIR/room-schema-files.log"; then
+            echo "ERROR: Room KAPT did not generate schema JSON."
+            tail -n 150 "$LOG_DIR/kotlin-room-kapt.log"
+            exit 1
+          fi
+
+          python3 - <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          schema_dir = pathlib.Path("app/schemas")
+          files = sorted(schema_dir.rglob("*.json"))
+
+          if not files:
+              print("ERROR: No Room schema JSON files found.")
+              sys.exit(1)
+
+          valid = []
+
+          for path in files:
+              try:
+                  data = json.loads(path.read_text(encoding="utf-8"))
+              except Exception as exc:
+                  print(f"INVALID JSON: {path}: {exc}")
+                  sys.exit(1)
+
+              database = data.get("database", {})
+
+              if database.get("version") == 3:
+                  valid.append(path)
+                  print(f"ROOM_VERSION_3_PASS: {path}")
+
+          if not valid:
+              print("ERROR: No valid Room database schema version 3 found.")
+              sys.exit(1)
+
+          print(f"ROOM_SCHEMA_JSON_COUNT={len(files)}")
+          print("ROOM_SCHEMA_VERSION=3")
+          print("ROOM_SCHEMA_VALIDATION=PASS")
+          PY
+
+          mkdir -p "$LOG_DIR/room-schemas"
+          cp -a "$SCHEMA_DIR/." "$LOG_DIR/room-schemas/"
+
+          echo "ROOM_SCHEMA_GENERATION=PASS" \
+            | tee "$LOG_DIR/room-schema-verification.log"
+
+          echo "Compiling Kotlin..."
+
+          gradle \
+            --no-daemon \
+            --no-build-cache \
+            --stacktrace \
+            --console=plain \
             :app:compileDebugKotlin \
             2>&1 | tee "$LOG_DIR/kotlin-room-compile.log"
 
-          test -d app/schemas || {
-            echo "ERROR: Room schema directory missing."
-            exit 1
-          }
-
-          find app/schemas -type f -name '*.json' -print \
-            | tee "$LOG_DIR/room-schema-files.log"
-
-          grep -q . "$LOG_DIR/room-schema-files.log"
-
-          grep -R -q '"version"[[:space:]]*:[[:space:]]*3' app/schemas || {
-            echo "ERROR: Expected Room schema version 3 missing."
-            exit 1
-          }
-
-          mkdir -p "$LOG_DIR/room-schemas"
-          cp -a app/schemas/. "$LOG_DIR/room-schemas/"
+          echo "KOTLIN_ROOM_COMPILE=PASS" \
+            | tee "$LOG_DIR/kotlin-room-status.log"
 
       # 14. JVM tests
       - name: Run JVM unit tests

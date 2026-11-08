@@ -412,8 +412,6 @@ jobs:
 
           SCHEMA_DIR="app/schemas"
 
-          # Remove only generated schema output.
-          # Project source, migrations and database files remain untouched.
           rm -rf "$SCHEMA_DIR"
           mkdir -p "$SCHEMA_DIR"
 
@@ -590,7 +588,7 @@ jobs:
           sha256sum "$APK" \
             | tee "$LOG_DIR/apk-final-sha256.log"
 
-      # 18. Enable KVM before emulator action
+      # 18. Enable KVM before emulator
       - name: Enable and verify KVM hardware acceleration
         id: kvm
         shell: bash
@@ -636,7 +634,7 @@ jobs:
           echo "ADB_SERVER_RESET=PASS" \
             | tee "$LOG_DIR/adb-reset.log"
 
-      # 20. Emulator instrumentation
+      # 20. API 36 emulator instrumentation tests
       - name: Run API 36 emulator instrumentation tests
         id: instrumentation
         uses: reactivecircus/android-emulator-runner@v2
@@ -659,6 +657,8 @@ jobs:
             -camera-back none
             -camera-front none
           pre-emulator-launch-script: |
+            set -eu
+
             if [ -e /dev/kvm ]; then
               sudo chmod 666 /dev/kvm
               test -r /dev/kvm
@@ -668,43 +668,105 @@ jobs:
               exit 1
             fi
           script: |
-            set -Eeuo pipefail
+            # The action uses /usr/bin/sh for this script.
+            # Run Bash explicitly to support pipefail and Bash syntax.
+            bash -Eeuo pipefail <<'BASH'
 
             cd "$PROJECT_ROOT"
 
             mkdir -p "$LOG_DIR"
 
-            echo "Waiting for emulator device..."
+            DEVICE="${ANDROID_SERIAL:-emulator-${EMULATOR_PORT:-5554}}"
+
+            echo "=== Emulator device discovery ==="
 
             adb devices -l \
               | tee "$LOG_DIR/emulator-devices-before-tests.log"
 
-            DEVICE="${ANDROID_SERIAL:-emulator-${EMULATOR_PORT:-5554}}"
-
-            adb -s "$DEVICE" wait-for-device
+            echo "=== Wait for emulator and recover ADB ==="
 
             BOOT_OK=0
+            OFFLINE_COUNT=0
+            ADB_RESTARTED=0
+            BOOT_COMPLETED_COUNT=0
 
             for ATTEMPT in $(seq 1 180); do
-              STATUS="$(
-                adb -s "$DEVICE" shell getprop sys.boot_completed \
-                  2>/dev/null | tr -d '\r' || true
+
+              STATE="$(
+                adb devices \
+                  | awk -v d="$DEVICE" '$1 == d {print $2}'
               )"
 
-              if [[ "$STATUS" == "1" ]]; then
-                BOOT_OK=1
-                break
+              if [[ "$STATE" == "offline" ]]; then
+
+                OFFLINE_COUNT=$((OFFLINE_COUNT + 1))
+
+                echo "ADB offline. Recovery attempt: $OFFLINE_COUNT"
+
+                adb reconnect offline \
+                  >/dev/null 2>&1 || true
+
+                if (( OFFLINE_COUNT >= 12 && ADB_RESTARTED == 0 )); then
+
+                  echo "Restarting ADB server..."
+
+                  adb kill-server || true
+                  sleep 3
+                  adb start-server || true
+
+                  ADB_RESTARTED=1
+                  OFFLINE_COUNT=0
+                fi
+
+              elif [[ "$STATE" == "device" ]]; then
+
+                BOOT_STATUS="$(
+                  adb -s "$DEVICE" shell getprop sys.boot_completed \
+                    2>/dev/null | tr -d '\r' || true
+                )"
+
+                if [[ "$BOOT_STATUS" == "1" ]]; then
+
+                  BOOT_COMPLETED_COUNT=$((BOOT_COMPLETED_COUNT + 1))
+
+                  if (( BOOT_COMPLETED_COUNT >= 3 )); then
+                    BOOT_OK=1
+                    break
+                  fi
+
+                else
+                  BOOT_COMPLETED_COUNT=0
+                fi
+
+              else
+                BOOT_COMPLETED_COUNT=0
+              fi
+
+              if (( ATTEMPT % 12 == 0 )); then
+                echo "Waiting for Android boot..."
+                echo "Attempt: $ATTEMPT"
+                echo "ADB state: ${STATE:-missing}"
+                adb devices -l || true
               fi
 
               sleep 5
             done
 
             if [[ "$BOOT_OK" -ne 1 ]]; then
+
               echo "ERROR: Emulator boot did not complete."
-              adb devices -l
+
+              adb devices -l || true
+
               adb -s "$DEVICE" emu avd name || true
+
+              adb logcat -d -t 1000 \
+                > "$LOG_DIR/emulator-logcat-failure.log" 2>&1 || true
+
               exit 1
             fi
+
+            echo "=== Verify Android API ==="
 
             API_LEVEL="$(
               adb -s "$DEVICE" shell getprop ro.build.version.sdk \
@@ -714,7 +776,10 @@ jobs:
             echo "EMULATOR_API_LEVEL=$API_LEVEL" \
               | tee "$LOG_DIR/emulator-api-level.log"
 
-            [[ "$API_LEVEL" == "36" ]]
+            if [[ "$API_LEVEL" != "36" ]]; then
+              echo "ERROR: Expected API 36, got $API_LEVEL"
+              exit 1
+            fi
 
             adb -s "$DEVICE" shell settings put global \
               window_animation_scale 0
@@ -725,11 +790,19 @@ jobs:
             adb -s "$DEVICE" shell settings put global \
               animator_duration_scale 0
 
-            echo "Running connected Android tests..."
+            echo "EMULATOR_BOOT=PASS" \
+              | tee "$LOG_DIR/emulator-boot-status.log"
 
-            gradle --no-daemon --stacktrace --console=plain \
+            echo "=== Run connected Android tests ==="
+
+            gradle \
+              --no-daemon \
+              --stacktrace \
+              --console=plain \
               :app:connectedDebugAndroidTest \
               2>&1 | tee "$LOG_DIR/android-instrumentation.log"
+
+            echo "=== Verify instrumentation reports ==="
 
             RESULTS="app/build/outputs/androidTest-results/connected"
 
@@ -750,6 +823,11 @@ jobs:
               echo "ERROR: Persistence round-trip test result missing."
               exit 1
             }
+
+            echo "ANDROID_INSTRUMENTATION=PASS" \
+              | tee "$LOG_DIR/instrumentation-status.log"
+
+            BASH
 
       # 21. Final summary
       - name: Create final build summary
@@ -778,10 +856,23 @@ jobs:
           S_ADB: ${{ steps.adb_reset.outcome }}
           S_ANDROID: ${{ steps.instrumentation.outcome }}
         run: |
-          set -u
+          set -Eeuo pipefail
 
           mkdir -p "$LOG_DIR"
-          RESULT=0
+
+          RESULT=PASS
+
+          for STATUS in \
+            "$S_CHECKOUT" "$S_PROJECT" "$S_JAVA" "$S_GRADLE" \
+            "$S_SDK" "$S_PACKAGES" "$S_KOTLIN" "$S_ENV" \
+            "$S_TASKS" "$S_DEPS" "$S_GUARD" "$S_STATIC" \
+            "$S_COMPILE" "$S_JVM" "$S_LINT" "$S_APK" \
+            "$S_APK_VERIFY" "$S_KVM" "$S_ADB" "$S_ANDROID"; do
+
+            if [[ "$STATUS" != "success" ]]; then
+              RESULT=FAIL_OR_INCOMPLETE
+            fi
+          done
 
           {
             echo "# AI Architecture Final CI Summary"
@@ -809,27 +900,15 @@ jobs:
             echo "KVM: $S_KVM"
             echo "ADB reset: $S_ADB"
             echo "Emulator tests: $S_ANDROID"
+            echo ""
+            echo "FINAL_RESULT=$RESULT"
           } | tee "$LOG_DIR/FINAL_BUILD_SUMMARY.md"
 
-          for STATUS in \
-            "$S_CHECKOUT" "$S_PROJECT" "$S_JAVA" "$S_GRADLE" \
-            "$S_SDK" "$S_PACKAGES" "$S_KOTLIN" "$S_ENV" \
-            "$S_TASKS" "$S_DEPS" "$S_GUARD" "$S_STATIC" \
-            "$S_COMPILE" "$S_JVM" "$S_LINT" "$S_APK" \
-            "$S_APK_VERIFY" "$S_KVM" "$S_ADB" "$S_ANDROID"; do
+          echo "FINAL_RESULT=$RESULT" >> "$GITHUB_STEP_SUMMARY"
 
-            [[ "$STATUS" == "success" ]] || RESULT=1
-          done
-
-          if [[ "$RESULT" -eq 0 ]]; then
-            echo "FINAL_RESULT=PASS" \
-              | tee -a "$LOG_DIR/FINAL_BUILD_SUMMARY.md"
-          else
-            echo "FINAL_RESULT=FAIL_OR_INCOMPLETE" \
-              | tee -a "$LOG_DIR/FINAL_BUILD_SUMMARY.md"
-          fi
-
-          exit "$RESULT"
+          # The failed build/test step already determines job failure.
+          # Keep this summary step informational.
+          exit 0
 
       # 22. Collect artifacts
       - name: Collect APK, logs and reports
